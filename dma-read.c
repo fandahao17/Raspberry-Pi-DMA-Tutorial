@@ -208,14 +208,47 @@ static void dma_alloc_pages() {
     }
 }
 
+static inline DMAControlBlock *ith_cb_virt_addr(int i) {
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return &((DMACbPage *)dma_cb_pages[page].virtual_addr)->cbs[index];
+}
+
+static inline uint32_t ith_cb_bus_addr(int i) {
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return (uint32_t)&((DMACbPage *)(uintptr_t)dma_cb_pages[page].bus_addr)->cbs[index];
+}
+
+static inline uint32_t *ith_tick_virt_addr(int i) {
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return &((DMAResultPage *)dma_result_pages[page].virtual_addr)->ticks[index];
+}
+
+static inline uint32_t ith_tick_bus_addr(int i) {
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return (uint32_t)&((DMAResultPage *)(uintptr_t)dma_result_pages[page].bus_addr)->ticks[index];
+}
+
+static inline uint32_t *ith_level_virt_addr(int i) {
+    int page = i / LEVELS_PER_PAGE, index = i % LEVELS_PER_PAGE;
+    return &((DMAResultPage *)dma_result_pages[page].virtual_addr)->levels[index];
+}
+
+static inline uint32_t ith_level_bus_addr(int i) {
+    int page = i / LEVELS_PER_PAGE, index = i % LEVELS_PER_PAGE;
+    return (uint32_t)&((DMAResultPage *)(uintptr_t)dma_result_pages[page].bus_addr)->levels[index];
+}
+
 static void dma_init_cbs() {
-    DMAControlBlock *cb = &((DMACbPage *)dma_cb_pages[0].virtual_addr)->cbs[0];
-    DMAControlBlock *cb_bus_addr = &((DMACbPage *)(uintptr_t)dma_cb_pages[0].bus_addr)->cbs[0];
+    // DMAControlBlock *cb = &((DMACbPage *)dma_cb_pages[0].virtual_addr)->cbs[0];
+    // uint32_t cb_bus_addr = &((DMACbPage *)(uintptr_t)dma_cb_pages[0].bus_addr)->cbs[0];
+    DMAControlBlock *cb = ith_cb_virt_addr(0);
     cb->ti = NORMAL_DMA;
     cb->source_ad = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
-    cb->dest_ad = &((DMAResultPage *)(uintptr_t)dma_result_pages[0].bus_addr)->levels[0];
+    cb->dest_ad = ith_tick_bus_addr(0);
     cb->txfr_len = 4;
-    cb->next_conbk = cb_bus_addr;
+    cb->next_conbk = ith_cb_bus_addr(0);
+    // printf("Init cb@%8X: Src: %8X, Dest: %8X, nextbk: %8X\n", 
+        // cb_bus_addr, cb->source_ad, cb->dest_ad, cb->next_conbk);
 }
 
 static void dma_start() {
@@ -226,7 +259,7 @@ static void dma_start() {
 
     dma_channel_hdr->cs = DMA_INTERRUPT_STATUS | DMA_END_FLAG;
 
-    dma_channel_hdr->conblk_ad = &((DMACbPage *)(uintptr_t)dma_cb_pages[0].bus_addr)->cbs[0];
+    dma_channel_hdr->conblk_ad = ith_cb_bus_addr(0);
     dma_channel_hdr->cs = DMA_PRIORITY(8) | DMA_PANIC_PRIORITY(8) | DMA_DISDEBUG;
     dma_channel_hdr->cs |= DMA_WAIT_ON_WRITES | DMA_ACTIVE;
 }
@@ -246,9 +279,17 @@ int main()
     uint32_t *systimer_reg = map_peripheral(SYSTIMER_BASE, SYST_LEN);
     a = systimer_reg[SYST_CLO];
     printf("%u\n", a);
-    dma_channel_hdr = map_peripheral(DMA_ADDR, PAGE_SIZE);
-    // printf("DMA: %u\n", ((DMAResultPage *)dma_result_pages[0].virtual_addr)->levels[0]);
-    // usleep(1000000);
-    printf("%u\n", b);
+    dma_channel_hdr = map_peripheral(DMA_BASE, PAGE_SIZE);
+    dma_alloc_pages();
+    dma_init_cbs();
+    usleep(100);
+    dma_start();
+    usleep(100);
+    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    dma_end();
     return 0;
 }
