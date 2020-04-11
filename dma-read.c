@@ -93,7 +93,7 @@
 #define TICKS_PER_PAGE            20
 #define LEVELS_PER_PAGE           1000
 #define PADDINGS_PER_PAGE         1000
-#define CBS_PER_PAGE              PAGE_SIZE / sizeof(DMAControlBlock)
+#define CBS_PER_PAGE              (PAGE_SIZE / sizeof(DMAControlBlock))
 // ---- Memory allocating defines
 // https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
 #define MEM_FLAG_DIRECT           (1 << 2)
@@ -215,6 +215,7 @@ static inline DMAControlBlock *ith_cb_virt_addr(int i) {
 
 static inline uint32_t ith_cb_bus_addr(int i) {
     int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    // printf("i = %d, Page: %d, index: %d, cpp: %d %d\n", i, page, index, CBS_PER_PAGE, 17 % CBS_PER_PAGE);
     return (uint32_t)&((DMACbPage *)(uintptr_t)dma_cb_pages[page].bus_addr)->cbs[index];
 }
 
@@ -241,14 +242,17 @@ static inline uint32_t ith_level_bus_addr(int i) {
 static void dma_init_cbs() {
     // DMAControlBlock *cb = &((DMACbPage *)dma_cb_pages[0].virtual_addr)->cbs[0];
     // uint32_t cb_bus_addr = &((DMACbPage *)(uintptr_t)dma_cb_pages[0].bus_addr)->cbs[0];
-    DMAControlBlock *cb = ith_cb_virt_addr(0);
-    cb->ti = NORMAL_DMA;
-    cb->source_ad = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
-    cb->dest_ad = ith_tick_bus_addr(0);
-    cb->txfr_len = 4;
-    cb->next_conbk = ith_cb_bus_addr(0);
-    // printf("Init cb@%8X: Src: %8X, Dest: %8X, nextbk: %8X\n", 
-        // cb_bus_addr, cb->source_ad, cb->dest_ad, cb->next_conbk);
+    for (int i = 0; i < TICKS_PER_PAGE; i++) {
+        DMAControlBlock *cb = ith_cb_virt_addr(i);
+        cb->ti = NORMAL_DMA;
+        cb->source_ad = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
+        cb->dest_ad = ith_tick_bus_addr(i);
+        cb->txfr_len = 4;
+        cb->next_conbk = ith_cb_bus_addr((i+1) % TICKS_PER_PAGE);
+        usleep(100);
+        printf("Init cb@%8X: Src: %8X, Dest: %8X, nextbk: %8X\n",
+               ith_cb_bus_addr(i), cb->source_ad, cb->dest_ad, cb->next_conbk);
+    }
 }
 
 static void dma_start() {
@@ -284,12 +288,12 @@ int main()
     dma_init_cbs();
     usleep(100);
     dma_start();
-    usleep(100);
-    printf("DMA: %u\n", *ith_tick_virt_addr(0));
-    printf("DMA: %u\n", *ith_tick_virt_addr(0));
-    printf("DMA: %u\n", *ith_tick_virt_addr(0));
-    printf("DMA: %u\n", *ith_tick_virt_addr(0));
-    printf("DMA: %u\n", *ith_tick_virt_addr(0));
+    usleep(1000);
+    uint32_t tis[TICKS_PER_PAGE];
+    memcpy(tis, ith_tick_virt_addr(0), TICKS_PER_PAGE * sizeof(uint32_t));
+    for (int i = 0; i < TICKS_PER_PAGE; i++) {
+        printf("DMA %d: %u\n", i, tis[i]);
+    }
     dma_end();
     return 0;
 }
