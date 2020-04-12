@@ -14,9 +14,9 @@ As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/upload
 
 Note that the *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*.
 
-The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the pivot being *DMA channel controller registers*. 
+The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the pivot being *DMA channel controller registers*. Note that all "pointer"s in the following image are **bus address**es.
 
-![Screen Shot 2020-04-12 at 3.44.00 PM](README.assets/Screen Shot 2020-04-12 at 3.44.00 PM.png)
+![Screen Shot 2020-04-12 at 3.44.00 PM](img/dma_demo.png)
 
 Detailed information about the DMA controller can be found in the datasheet.
 
@@ -32,8 +32,9 @@ Detailed information about the DMA controller can be found in the datasheet.
 
 
 
-##Pacing DMA accesses with *DREQ*
+## Pacing DMA accesses with *DREQ*
 
 
 
-## Final example: Monitoring GPIO level changes at the accuracy of microsecond
+## Final example: Monitoring GPIO changes at the us-level accuracy
+
