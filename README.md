@@ -24,9 +24,22 @@ Detailed information about the DMA controller can be found in the datasheet.
 
 
 
-## Allocating DMA memory with *pagemap* or *mailbox*
+## Allocating DMA Control Blocks and Result Buffer
 
+The next step is to allocate our control blocks and a buffer to store DMA results. What's special about this is that since DMA accesses uses *bus address*, we at least need to know the *physical address* of our allocated memory region.
 
+A natural way to get physical addresses out of virtual addresses would be using Linux's [`pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) interface. However, this is not reliable because   we can't guarantee the memory we have is [cache coherent](https://en.wikipedia.org/wiki/Direct_memory_access#Cache_coherency), which is **crucial to proper DMA**. Also, the physical address backing a certain virtual address may be **subject to change**. Thus, it's not recommended to use `pagemap`.
+
+As pointed out [here](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example/blob/f0d5043eebce06ef5d35526e6ca16f1638c4081c/dma-gpio.c#L44) (although I can't open its referenced page) the RasPi memory can be partitioned into 4 sections regarding their cache usage:
+
+| Memory starting at |                        Cache                        |
+| :----------------: | :-------------------------------------------------: |
+|     0x00000000     |                    L1 & L2 cache                    |
+|     0x40000000     | L2 cache coherent <br />(meaning L1 write-through?) |
+|     0x80000000     |                    L2 cache only                    |
+|     0xc0000000     |                   direct uncached                   |
+
+The mailbox property interface documentation suggests that memory sections with 0x8 and 0xc alias seem to be coherent when using DMA.
 
 ## Starting DMA transfer 
 
