@@ -1,2 +1,5 @@
-# Raspberry-Pi-DMA-GPIO-read
-High speed (at least 1KHz) read of Raspberry Pi GPIOs with its DMA channel
+# A simple guide on using RasPi DMA channels
+
+Suppose you need to monitor the level changes of your Pi's GPIOs and report them as soon as possible. This will be as simple as a single *interrupt* if you are programming on *bare metal*. However, things are much more complicated if you are working on Pi's Linux system with tens of other processes running. To avoid your program from occupying all the CPU cycles, you need to use **DMA**.
+
+I found that there actually exists very few resources on how to use Raspberry Pi's DMA channel properly. [Pigpio](http://abyz.me.uk/rpi/pigpio/index.html) uses DMA accesses to achieve microsecond-level sampling, but as the project is fairly large now it's not very suitable for beginners. However, pigpio, along with [Wallacoloo's example](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example) (a little old) and [hezller's demo](https://github.com/hzeller/rpi-gpio-dma-demo) are great references when you write code to control the DMA channels.
