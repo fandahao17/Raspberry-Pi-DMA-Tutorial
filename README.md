@@ -68,7 +68,24 @@ The mailbox property interface documentation suggests that memory sections with 
 
 ## Starting DMA transfer 
 
+It's quite straightforward to initialize the *DMA control block linked lis*t. Here is the code for setting up the $i^{th}$ control block:
 
+``` c
+DMAControlBlock *cb = ith_cb_virt_addr(i);
+cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
+cb->src = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;  // Bus address of the lower word of system timer
+cb->dest = ith_tick_bus_addr(i);
+cb->tx_len = 4;
+cb->next_cb = ith_cb_bus_addr((i + 1) % NUM_CBS);  // A circular list here to do DMA indefinitely
+```
+
+After that, let the *DMA controller register* (the "pivot") to point to the first *DMA control block* and set the `active` bit in the `CS` field.
+
+You could code until now in[ `FILE`](). Now that the DMA starts, we could see the results of 20 consecutive fetches to the system timer:
+
+``` 
+result
+```
 
 ## Pacing DMA accesses with *DREQ*
 
