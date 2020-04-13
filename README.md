@@ -14,15 +14,47 @@ As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/upload
 
 Note that the *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*.
 
+The BCM2835 has 16 DMA channels. The *DMA channel controller registers* start at *bus address* 0x7E007000, with adjacent channels offset by 0x100.
+
 The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the pivot being *DMA channel controller registers*. Note that all "pointer"s in the following image are **bus address**es.
 
 ![Screen Shot 2020-04-12 at 3.44.00 PM](img/dma_demo.png)
 
 Detailed information about the DMA controller can be found in the datasheet.
 
-## Mapping peripherals into virtual memory with *mmap()*
+## Mapping peripherals into virtual memory
 
+As metioned above, peripherals can be accessed by user programs with their *physical address*. In order to configure the DMA channel, we need to bring the DMA controller registers into *virtual memory*.
 
+The way we access these memory-mapped peripherals is to `mmap` the `/dev/mem` interface. We can wrap this process inside a function, note that I omitted error handling code here for clarity.
+
+``` c
+void *map_peripheral(uint32_t peri_offset, uint32_t size)
+{
+    // Check mem(4) for "/dev/mem"
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+
+    uint32_t *result = (uint32_t *)mmap(
+        NULL,
+        size,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        mem_fd,
+        PERI_PHYS_BASE + peri_offset); // PERI_PHYS_BASE defined as 0x3F00000
+
+    close(mem_fd);
+
+    return result;
+}
+```
+
+Note that the `offset` parameter of `mmap` requires alignment by page, so you may nees to do some pointer arithmetic when mapping these peripherals.
+
+``` c
+uint8_t *dma_base_ptr = map_peripheral(DMA_BASE, PAGE_SIZE);
+// We use DMA channel 5 here, so DMA_CHANNEL defined as 5
+dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x100);
+```
 
 ## Allocating DMA Control Blocks and Result Buffer
 
@@ -30,14 +62,7 @@ The next step is to allocate our control blocks and a buffer to store DMA result
 
 A natural way to get physical addresses out of virtual addresses would be using Linux's [`pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) interface. However, this is not reliable because   we can't guarantee the memory we have is [cache coherent](https://en.wikipedia.org/wiki/Direct_memory_access#Cache_coherency), which is **crucial to proper DMA**. Also, the physical address backing a certain virtual address may be **subject to change**. Thus, it's not recommended to use `pagemap`.
 
-As pointed out [here](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example/blob/f0d5043eebce06ef5d35526e6ca16f1638c4081c/dma-gpio.c#L44) (although I can't open its referenced page) the RasPi memory can be partitioned into 4 sections regarding their cache usage:
-
-| Memory starting at |                        Cache                        |
-| :----------------: | :-------------------------------------------------: |
-|     0x00000000     |                    L1 & L2 cache                    |
-|     0x40000000     | L2 cache coherent <br />(meaning L1 write-through?) |
-|     0x80000000     |                    L2 cache only                    |
-|     0xc0000000     |                   direct uncached                   |
+[This](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example/blob/f0d5043eebce06ef5d35526e6ca16f1638c4081c/dma-gpio.c#L44) post is 
 
 The mailbox property interface documentation suggests that memory sections with 0x8 and 0xc alias seem to be coherent when using DMA.
 
