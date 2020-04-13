@@ -107,9 +107,7 @@
 #define DMA_DEST_INC (1 << 4)
 #define DMA_WAIT_RESP (1 << 3)
 
-#define NORMAL_DMA (DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP)
-
-#define TIMED_DMA(x) (DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(x))
+#define TIMED_DMA(x) ()
 
 #define CB_PAGES_COUNT 1
 #define RESULT_PAGES_COUNT 1
@@ -125,19 +123,19 @@
 
 typedef struct DMAChannelHeader
 {
-    uint32_t cs;        // DMA Channel Control and Status register
-    uint32_t conblk_ad; // DMA Channel Control Block Address
+    uint32_t cs;            // DMA Channel Control and Status register
+    uint32_t cb_addr;       // DMA Channel Control Block Address
 } DMAChannelHeader;
 
 typedef struct DMAControlBlock
 {
-    uint32_t ti;         // Transfer information
-    uint32_t source_ad;  // Source (bus) address
-    uint32_t dest_ad;    // Destination (bus) address
-    uint32_t txfr_len;   // Transfer length (in bytes)
-    uint32_t stride;     // 2D stride
-    uint32_t next_conbk; // Next DMAControlBlock (bus) address
-    uint32_t padding[2]; // 2-word padding
+    uint32_t tx_info;       // Transfer information
+    uint32_t src;           // Source (bus) address
+    uint32_t dest;          // Destination (bus) address
+    uint32_t tx_len;        // Transfer length (in bytes)
+    uint32_t stride;        // 2D stride
+    uint32_t next_cb;       // Next DMAControlBlock (bus) address
+    uint32_t padding[2];    // 2-word padding
 } DMAControlBlock;
 
 typedef struct DMACbPage
@@ -222,12 +220,13 @@ static void *map_peripheral(uint32_t addr, uint32_t size)
     }
 
     uint32_t *result = (uint32_t *)mmap(
-        NULL, // Any adddress in our space will do
+        NULL,
         size,
-        PROT_READ | PROT_WRITE, // Enable r/w on GPIO registers.
+        PROT_READ | PROT_WRITE,
         MAP_SHARED,
-        mem_fd, // File to map
+        mem_fd,
         PERI_PHYS_BASE + addr);
+
     close(mem_fd);
 
     if (result == MAP_FAILED)
@@ -292,18 +291,18 @@ static void dma_init_cbs()
     for (int i = 0; i < TICKS_PER_PAGE; i++)
     {
         DMAControlBlock *cb = ith_cb_virt_addr(2 * i);
-        cb->ti = NORMAL_DMA;
-        cb->source_ad = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
-        cb->dest_ad = ith_tick_bus_addr(i);
-        cb->txfr_len = 4;
-        cb->next_conbk = ith_cb_bus_addr((2 * i + 1) % (TICKS_PER_PAGE * 2));
+        cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
+        cb->src = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
+        cb->dest = ith_tick_bus_addr(i);
+        cb->tx_len = 4;
+        cb->next_cb = ith_cb_bus_addr((2 * i + 1) % (TICKS_PER_PAGE * 2));
 
         cb = ith_cb_virt_addr(2 * i + 1);
-        cb->ti = NORMAL_DMA | TIMED_DMA(5);
-        cb->source_ad = ith_cb_bus_addr(0);
-        cb->dest_ad = PWM_TIMER;
-        cb->txfr_len = 4;
-        cb->next_conbk = ith_cb_bus_addr((2 * i + 2) % (TICKS_PER_PAGE * 2));
+        cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
+        cb->src = ith_cb_bus_addr(0);
+        cb->dest = PWM_TIMER;
+        cb->tx_len = 4;
+        cb->next_cb = ith_cb_bus_addr((2 * i + 2) % (TICKS_PER_PAGE * 2));
         // usleep(100);
         // printf("Init cb@%8X: Src: %8X, Dest: %8X, nextbk: %8X\n",
         //    ith_cb_bus_addr(i), cb->source_ad, cb->dest_ad, cb->next_conbk);
@@ -366,11 +365,11 @@ static void dma_start()
     dma_channel_hdr->cs = DMA_CHANNEL_ABORT;
     dma_channel_hdr->cs = 0;
     dma_channel_hdr->cs = DMA_CHANNEL_RESET;
-    dma_channel_hdr->conblk_ad = 0;
+    dma_channel_hdr->cb_addr = 0;
 
     dma_channel_hdr->cs = DMA_INTERRUPT_STATUS | DMA_END_FLAG;
 
-    dma_channel_hdr->conblk_ad = ith_cb_bus_addr(0);
+    dma_channel_hdr->cb_addr = ith_cb_bus_addr(0);
     dma_channel_hdr->cs = DMA_PRIORITY(8) | DMA_PANIC_PRIORITY(8) | DMA_DISDEBUG;
     dma_channel_hdr->cs |= DMA_WAIT_ON_WRITES | DMA_ACTIVE;
 }
@@ -391,7 +390,8 @@ int main()
     uint32_t *systimer_reg = map_peripheral(SYSTIMER_BASE, SYST_LEN);
     a = systimer_reg[SYST_CLO];
     printf("%u\n", a);
-    dma_channel_hdr = map_peripheral(DMA_BASE, PAGE_SIZE);
+    uint8_t *dma_base_ptr = map_peripheral(DMA_BASE, PAGE_SIZE);
+    dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x100);
     dma_alloc_pages();
     dma_init_clock();
     usleep(100);
