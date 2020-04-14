@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <pthread.h>
+#include <signal.h>
 
 #include "mailbox.h"
 
@@ -27,7 +27,7 @@
 #define CLK_LEN 0xA8
 #define CLK_PWMCTL 40
 #define CLK_PWMDIV 41
-#define CLK_MICROS 1
+#define CLK_MICROS 5
 #define CLK_CTL_BUSY (1 << 7)
 #define CLK_CTL_KILL (1 << 5)
 #define CLK_CTL_ENAB (1 << 4)
@@ -78,7 +78,7 @@
 #define SYST_CLO 1
 
 #define DMA_BASE 0x00007000
-#define DMA_CHANNEL 5
+#define DMA_CHANNEL 6
 #define DMA_OFFSET 0x100
 #define DMA_ADDR (DMA_BASE + DMA_OFFSET * (DMA_CHANNEL >> 2))
 
@@ -179,7 +179,9 @@ typedef struct PWMHeader
 static int mailbox_fd = -1;
 static DMAMemPageHandle dma_cb_pages;
 static DMAMemPageHandle dma_result_pages;
-static DMAChannelHeader *dma_channel_hdr;
+static volatile DMAChannelHeader *dma_channel_hdr;
+static volatile PWMHeader *pwm_reg;
+static volatile uint32_t *clk_reg;
 static int terminated = 0;
 
 static DMAMemPageHandle mem_page_alloc(unsigned int size)
@@ -216,6 +218,7 @@ static void mem_page_free(DMAMemPageHandle *page)
     mem_unlock(mailbox_fd, page->mem_handle);
     mem_free(mailbox_fd, page->mem_handle);
     page->virtual_addr = NULL;
+    fprintf(stderr, "Mem freed\n");
 }
 
 static void *map_peripheral(uint32_t addr, uint32_t size)
@@ -333,32 +336,32 @@ static void dma_init_cbs()
 static void init_pwm_clk()
 {
     /* kill the clock if busy, anything else isn't reliable */
-    uint32_t *clkReg = map_peripheral(CLK_BASE, CLK_LEN);
+    clk_reg = map_peripheral(CLK_BASE, CLK_LEN);
     size_t clkCtl = CLK_PWMCTL, clkDiv = CLK_PWMDIV, divI = 5;
-    if (clkReg[clkCtl] & CLK_CTL_BUSY)
+    if (clk_reg[clkCtl] & CLK_CTL_BUSY)
     {
         do
         {
-            clkReg[clkCtl] = BCM_PASSWD | CLK_CTL_KILL;
-        } while (clkReg[clkCtl] & CLK_CTL_BUSY);
+            clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_KILL;
+        } while (clk_reg[clkCtl] & CLK_CTL_BUSY);
     }
 
-   clkReg[clkDiv] = BCM_PASSWD | CLK_DIV_DIVI(divI);
+   clk_reg[clkDiv] = BCM_PASSWD | CLK_DIV_DIVI(divI);
 
    usleep(10);
 
-   clkReg[clkCtl] = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
+   clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
 
    usleep(10);
 
-   clkReg[clkCtl] |= (BCM_PASSWD | CLK_CTL_ENAB);
+   clk_reg[clkCtl] |= (BCM_PASSWD | CLK_CTL_ENAB);
 }
 
 static void dma_init_clock()
 {
     init_pwm_clk();
     int bits = 100 * CLK_MICROS;
-    PWMHeader *pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
+    pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
 
     /* reset PWM */
     pwm_reg->ctl = 0;
@@ -416,20 +419,30 @@ static inline uint32_t get_level_from_cb(uint32_t cb) {
     // TODO: define
     uint32_t slot = cb / (1 + 2 * LEVELS_PER_PAGE / TICKS_PER_PAGE);
     uint32_t index = cb % (1 + 2 * LEVELS_PER_PAGE / TICKS_PER_PAGE);
-    return slot * (LEVELS_PER_PAGE / TICKS_PER_PAGE) + index / 2;
+    return slot * (LEVELS_PER_PAGE / TICKS_PER_PAGE) + (index > 1 ? index - 1 : index) / 2;
 }
 
-void *monitor_thread(void *arg) {
-    pthread_detach(pthread_self());
+void monitor_thread() {
     printf("Enter thread\n");
     uint32_t cur_level = 0, cur_idx, old_idx = 0, cur_time;
+    usleep(1000 * 10);
     while (1)
     {
         if (terminated) {
             break;
         }
         uint32_t adr = get_cb_from_addr(dma_channel_hdr->cb_addr);
+        if (!(adr >= 0 && adr < CB_CNT)) {
+            fprintf(stderr, "adr: %u, address: 0x%8X", adr, dma_channel_hdr->cb_addr);
+            fprintf(stderr, "\nOld_idx: %u", old_idx);
+            exit(0);
+        }
         cur_idx = get_level_from_cb(adr);
+        if (!(cur_idx >= 0 && cur_idx < LEVEL_CNT)) {
+            fprintf(stderr, "cur_idx: %u, adr: %u, address: 0x%8X", cur_idx, adr, dma_channel_hdr->cb_addr);
+            fprintf(stderr, "\nOld_idx: %u", old_idx);
+            exit(0);
+        }
         while (old_idx != cur_idx) {
             if (old_idx % (LEVELS_PER_PAGE / TICKS_PER_PAGE) == 0) {
                 cur_time = *ith_tick_virt_addr(old_idx / (LEVELS_PER_PAGE / TICKS_PER_PAGE));
@@ -445,17 +458,26 @@ void *monitor_thread(void *arg) {
         // uint32_t *t = ith_tick_virt_addr(0);
         // uint32_t *g = ith_level_virt_addr(0);
         // fprintf(stderr, "%u %u\n", *t, get_level_from_cb(adr));
-        usleep(10 * 1000);
+        usleep(5 * 1000);
     }
-    // Should not reach here
-    return NULL;
+}
+
+void sigint_handler(int signo) {
+    if (signo == SIGINT) {
+        fprintf(stderr, "Handler called!\n");
+        dma_end();
+        exit(0);
+    }
 }
 
 int main()
 {
     atexit(dma_end);
+    if (signal(SIGINT, sigint_handler) == SIG_ERR) {
+        fprintf(stderr, "Signal failed\n");
+    }
     volatile uint32_t a, b;
-    uint32_t *systimer_reg = map_peripheral(SYSTIMER_BASE, SYST_LEN);
+    // uint32_t *systimer_reg = map_peripheral(SYSTIMER_BASE, SYST_LEN);
     uint8_t *dma_base_ptr = map_peripheral(DMA_BASE, PAGE_SIZE);
     dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x100);
     dma_alloc_pages();
@@ -466,14 +488,12 @@ int main()
     dma_start();
     usleep(1000);
 
-    pthread_t pth_monitor;
-    fprintf(stderr, "%d\n", pthread_create(&pth_monitor, NULL, monitor_thread, NULL));
+    monitor_thread();
     // memcpy(tis, ith_tick_virt_addr(0), TICKS_PER_PAGE * sizeof(uint32_t));
     // for (int i = 0; i < TICKS_PER_PAGE; i++)
     // {
         // fprintf(stderr, "DMA %d: %u\n", i, tis[i]);
     // }
-    sleep(20);
     dma_end();
     return 0;
 }
