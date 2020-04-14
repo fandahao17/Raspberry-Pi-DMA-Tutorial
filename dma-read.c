@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #include "mailbox.h"
 
@@ -107,19 +108,23 @@
 #define DMA_DEST_INC (1 << 4)
 #define DMA_WAIT_RESP (1 << 3)
 
-#define TIMED_DMA(x) ()
-
-#define CB_PAGES_COUNT 1
-#define RESULT_PAGES_COUNT 1
 #define TICKS_PER_PAGE 20
 #define LEVELS_PER_PAGE 1000
-#define PADDINGS_PER_PAGE 1000
+#define PADDINGS_PER_PAGE 4
 #define CBS_PER_PAGE (PAGE_SIZE / sizeof(DMAControlBlock))
 // ---- Memory allocating defines
 // https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
 #define MEM_FLAG_DIRECT (1 << 2)
 #define MEM_FLAG_COHERENT (2 << 2)
 #define MEM_FLAG_L1_NONALLOCATING (MEM_FLAG_DIRECT | MEM_FLAG_COHERENT)
+
+#define BUFFER_MS 100
+#define LEVEL_CNT (BUFFER_MS * (1000 / CLK_MICROS))  // Number of `level` entries in buffer
+#define RESULT_PAGE_CNT (LEVEL_CNT / LEVELS_PER_PAGE)
+#define TICK_CNT (RESULT_PAGE_CNT * TICKS_PER_PAGE)
+#define DELAY_CNT LEVEL_CNT
+#define CB_CNT (LEVEL_CNT + TICK_CNT + DELAY_CNT)
+#define CB_PAGE_CNT ((CB_CNT + CBS_PER_PAGE - 1) / CBS_PER_PAGE)
 
 typedef struct DMAChannelHeader
 {
@@ -172,11 +177,12 @@ typedef struct PWMHeader
 } PWMHeader;
 
 static int mailbox_fd = -1;
-static DMAMemPageHandle dma_cb_pages[CB_PAGES_COUNT];
-static DMAMemPageHandle dma_result_pages[RESULT_PAGES_COUNT];
+static DMAMemPageHandle dma_cb_pages;
+static DMAMemPageHandle dma_result_pages;
 static DMAChannelHeader *dma_channel_hdr;
+static int terminated = 0;
 
-static DMAMemPageHandle mem_page_alloc()
+static DMAMemPageHandle mem_page_alloc(unsigned int size)
 {
     if (mailbox_fd < 0)
     {
@@ -185,16 +191,19 @@ static DMAMemPageHandle mem_page_alloc()
             fprintf(stderr, "Failed to open /dev/vcio\n");
         }
     }
+    
+    // Make `size` a multiple of PAGE_SIZE
+    size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
     DMAMemPageHandle page;
-    page.mem_handle = mem_alloc(mailbox_fd, PAGE_SIZE, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
+    page.mem_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
     page.bus_addr = mem_lock(mailbox_fd, page.mem_handle);
-    page.virtual_addr = mapmem(BUS_TO_PHYS(page.bus_addr), PAGE_SIZE);
+    page.virtual_addr = mapmem(BUS_TO_PHYS(page.bus_addr), size);
 
-    fprintf(stderr, "Alloc: %6d bytes;  %p (bus=0x%08x, phys=0x%08x)\n",
-            (int)PAGE_SIZE, page.virtual_addr, page.bus_addr, BUS_TO_PHYS(page.bus_addr));
+    fprintf(stderr, "Alloc: %6u bytes;  %p (bus=0x%08x, phys=0x%08x)\n",
+            size, page.virtual_addr, page.bus_addr, BUS_TO_PHYS(page.bus_addr));
     assert(page.bus_addr); // otherwise: couldn't allocate contiguous block.
-    memset(page.virtual_addr, 0x00, PAGE_SIZE);
+    // memset(page.virtual_addr, 0x00, PAGE_SIZE);
     return page;
 }
 
@@ -239,74 +248,86 @@ static void *map_peripheral(uint32_t addr, uint32_t size)
 
 static void dma_alloc_pages()
 {
-    for (size_t i = 0; i < CB_PAGES_COUNT; i++)
-    {
-        dma_cb_pages[i] = mem_page_alloc();
-    }
-    for (size_t i = 0; i < RESULT_PAGES_COUNT; i++)
-    {
-        dma_result_pages[i] = mem_page_alloc();
-    }
+    fprintf(stderr, "Total cbs: %u", CB_CNT);
+    dma_cb_pages = mem_page_alloc(CB_PAGE_CNT * sizeof(DMACbPage));
+    dma_result_pages = mem_page_alloc(RESULT_PAGE_CNT * sizeof(DMAResultPage));
 }
 
 static inline DMAControlBlock *ith_cb_virt_addr(int i)
 {
     int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
-    return &((DMACbPage *)dma_cb_pages[page].virtual_addr)->cbs[index];
+    return &((DMACbPage *)dma_cb_pages.virtual_addr)[page].cbs[index];
 }
 
 static inline uint32_t ith_cb_bus_addr(int i)
 {
     int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
     // printf("i = %d, Page: %d, index: %d, cpp: %d %d\n", i, page, index, CBS_PER_PAGE, 17 % CBS_PER_PAGE);
-    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages[page].bus_addr)->cbs[index];
+    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)[page].cbs[index];
 }
 
 static inline uint32_t *ith_tick_virt_addr(int i)
 {
     int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
-    return &((DMAResultPage *)dma_result_pages[page].virtual_addr)->ticks[index];
+    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].ticks[index];
 }
 
 static inline uint32_t ith_tick_bus_addr(int i)
 {
     int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
-    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages[page].bus_addr)->ticks[index];
+    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].ticks[index];
 }
 
 static inline uint32_t *ith_level_virt_addr(int i)
 {
     int page = i / LEVELS_PER_PAGE, index = i % LEVELS_PER_PAGE;
-    return &((DMAResultPage *)dma_result_pages[page].virtual_addr)->levels[index];
+    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].levels[index];
 }
 
 static inline uint32_t ith_level_bus_addr(int i)
 {
     int page = i / LEVELS_PER_PAGE, index = i % LEVELS_PER_PAGE;
-    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages[page].bus_addr)->levels[index];
+    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].levels[index];
 }
 
 static void dma_init_cbs()
 {
-    for (int i = 0; i < TICKS_PER_PAGE; i++)
+    int tick_idx = 0, level_idx = 0, cb_idx = 0;
+    DMAControlBlock *cb;
+    for (tick_idx = 0; tick_idx < TICK_CNT; tick_idx++)
     {
-        DMAControlBlock *cb = ith_cb_virt_addr(2 * i);
+        cb = ith_cb_virt_addr(cb_idx);
         cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
         cb->src = PERI_BUS_BASE + SYSTIMER_BASE + SYST_CLO * 4;
-        cb->dest = ith_tick_bus_addr(i);
+        cb->dest = ith_tick_bus_addr(tick_idx);
         cb->tx_len = 4;
-        cb->next_cb = ith_cb_bus_addr((2 * i + 1) % (TICKS_PER_PAGE * 2));
+        cb_idx = (cb_idx + 1) % CB_CNT;
+        cb->next_cb = ith_cb_bus_addr(cb_idx);
 
-        cb = ith_cb_virt_addr(2 * i + 1);
-        cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
-        cb->src = ith_cb_bus_addr(0);
-        cb->dest = PWM_TIMER;
-        cb->tx_len = 4;
-        cb->next_cb = ith_cb_bus_addr((2 * i + 2) % (TICKS_PER_PAGE * 2));
+        for (int i = 0; i < LEVELS_PER_PAGE / TICKS_PER_PAGE; i++) {
+            // Level block
+            cb = ith_cb_virt_addr(cb_idx);
+            cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
+            cb->src = PERI_BUS_BASE + GPIO_BASE + GPLEV0 * 4;
+            cb->dest = ith_level_bus_addr(level_idx++);
+            cb->tx_len = 4;
+            cb_idx = (cb_idx + 1) % CB_CNT;
+            cb->next_cb = ith_cb_bus_addr(cb_idx);
+
+            // Delay block
+            cb = ith_cb_virt_addr(cb_idx);
+            cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
+            cb->src = ith_cb_bus_addr(0);
+            cb->dest = PWM_TIMER;
+            cb->tx_len = 4;
+            cb_idx = (cb_idx + 1) % CB_CNT;
+            cb->next_cb = ith_cb_bus_addr(cb_idx);
+        }
         // usleep(100);
         // printf("Init cb@%8X: Src: %8X, Dest: %8X, nextbk: %8X\n",
         //    ith_cb_bus_addr(i), cb->source_ad, cb->dest_ad, cb->next_conbk);
     }
+    fprintf(stderr, "Init: %d cbs, %d levels, %d ticks\n", cb_idx, level_idx, tick_idx);
 }
 
 static void init_pwm_clk()
@@ -376,6 +397,10 @@ static void dma_start()
 
 static void dma_end()
 {
+    terminated = 1;
+    usleep(1000 * 10);
+    mem_page_free(&dma_result_pages);
+    mem_page_free(&dma_cb_pages);
     // Shutdown DMA channel.
     dma_channel_hdr->cs |= DMA_CHANNEL_ABORT;
     usleep(100);
@@ -383,13 +408,54 @@ static void dma_end()
     dma_channel_hdr->cs |= DMA_CHANNEL_RESET;
 }
 
+static inline uint32_t get_cb_from_addr(uint32_t cb_addr) {
+    return (cb_addr - dma_cb_pages.bus_addr) / sizeof(DMAControlBlock);
+}
+
+static inline uint32_t get_level_from_cb(uint32_t cb) {
+    // TODO: define
+    uint32_t slot = cb / (1 + 2 * LEVELS_PER_PAGE / TICKS_PER_PAGE);
+    uint32_t index = cb % (1 + 2 * LEVELS_PER_PAGE / TICKS_PER_PAGE);
+    return slot * (LEVELS_PER_PAGE / TICKS_PER_PAGE) + index / 2;
+}
+
+void *monitor_thread(void *arg) {
+    pthread_detach(pthread_self());
+    printf("Enter thread\n");
+    uint32_t cur_level = 0, cur_idx, old_idx = 0, cur_time;
+    while (1)
+    {
+        if (terminated) {
+            break;
+        }
+        uint32_t adr = get_cb_from_addr(dma_channel_hdr->cb_addr);
+        cur_idx = get_level_from_cb(adr);
+        while (old_idx != cur_idx) {
+            if (old_idx % (LEVELS_PER_PAGE / TICKS_PER_PAGE) == 0) {
+                cur_time = *ith_tick_virt_addr(old_idx / (LEVELS_PER_PAGE / TICKS_PER_PAGE));
+            }
+            uint32_t level = *ith_level_virt_addr(old_idx) & ~0xF0000000;
+            if (level != cur_level) {
+                fprintf(stderr, "Level change @%u: %08X\n", cur_time, level);
+                cur_level = level;
+            }
+            cur_time += CLK_MICROS; // It will automatically wrap up
+            old_idx = (old_idx + 1) % LEVEL_CNT;
+        }
+        // uint32_t *t = ith_tick_virt_addr(0);
+        // uint32_t *g = ith_level_virt_addr(0);
+        // fprintf(stderr, "%u %u\n", *t, get_level_from_cb(adr));
+        usleep(10 * 1000);
+    }
+    // Should not reach here
+    return NULL;
+}
+
 int main()
 {
-    printf("Hello, world!\n");
+    atexit(dma_end);
     volatile uint32_t a, b;
     uint32_t *systimer_reg = map_peripheral(SYSTIMER_BASE, SYST_LEN);
-    a = systimer_reg[SYST_CLO];
-    printf("%u\n", a);
     uint8_t *dma_base_ptr = map_peripheral(DMA_BASE, PAGE_SIZE);
     dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x100);
     dma_alloc_pages();
@@ -399,12 +465,15 @@ int main()
     usleep(100);
     dma_start();
     usleep(1000);
-    uint32_t tis[TICKS_PER_PAGE];
-    memcpy(tis, ith_tick_virt_addr(0), TICKS_PER_PAGE * sizeof(uint32_t));
-    for (int i = 0; i < TICKS_PER_PAGE; i++)
-    {
-        printf("DMA %d: %u\n", i, tis[i]);
-    }
+
+    pthread_t pth_monitor;
+    fprintf(stderr, "%d\n", pthread_create(&pth_monitor, NULL, monitor_thread, NULL));
+    // memcpy(tis, ith_tick_virt_addr(0), TICKS_PER_PAGE * sizeof(uint32_t));
+    // for (int i = 0; i < TICKS_PER_PAGE; i++)
+    // {
+        // fprintf(stderr, "DMA %d: %u\n", i, tis[i]);
+    // }
+    sleep(20);
     dma_end();
     return 0;
 }
