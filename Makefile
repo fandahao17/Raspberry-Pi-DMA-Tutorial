@@ -1,5 +1,4 @@
 CFLAGS=-O3 -W -Wall -std=c99 -D_XOPEN_SOURCE=500
-LDFLAGS=-lpthread
 
 all: dma-read
 	
