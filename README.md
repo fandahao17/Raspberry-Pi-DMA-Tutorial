@@ -1,8 +1,10 @@
-# A simple guide on using RasPi DMA channels
+# A simple tutorial on using Raspberry Pi DMA channels
 
 Suppose you need to monitor the level changes of your Pi's GPIOs and report them as soon as possible. This could be as simple as a single *interrupt* if you are programming on *bare metal*. However, things are much more complicated if you are working on Pi's Linux system with tens of other processes running. To avoid your program from occupying all the CPU cycles, you need to use **DMA**.
 
-I found that there actually exists very few resources on how to use Raspberry Pi's DMA channel properly. [Pigpio](http://abyz.me.uk/rpi/pigpio/index.html) uses DMA accesses to achieve microsecond-level sampling, but as the project is fairly large now it's not very suitable for beginners. However, pigpio, along with [Wallacoloo's example](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example) (a little old) and [hezller's demo](https://github.com/hzeller/rpi-gpio-dma-demo) are great references when you write code to control the DMA channels.
+I found that there actually exists very few tutorial-like resources on how to use Raspberry Pi's DMA channel properly. So I wrote this article for those who need to control DMA channels themselves, or (like me) are just curious about how great tools like [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) achieves high-speed sampling while consuming extremely low CPU resources. I'm not an expert in Raspberry Pi, so I **welcome any comments or suggestions** so I can improve this tutorial.
+
+**In this tutorial**, we will first control the DMA to continuously fetch the BCM2835 system timer, then we will pace DMA accesses with the PWM peripheral so we can designate a fixed DMA sample rate. I choose the system timer here because it increments every microsecond, so we can easily check whether our code is working correctly. Finally, I'm going to present a demo that uses DMA to monitor GPIO level changes at the accuracy of 1 us.
 
 ## Background knowledge
 
@@ -31,7 +33,7 @@ The way we access these memory-mapped peripherals is to `mmap` the `/dev/mem` in
 ``` c
 void *map_peripheral(uint32_t peri_offset, uint32_t size)
 {
-    // Check mem(4) for "/dev/mem"
+    // Check mem(4) man page for "/dev/mem"
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
 
     uint32_t *result = (uint32_t *)mmap(
@@ -87,7 +89,7 @@ dma_reg->cs = DMA_PRIORITY(8) | DMA_PANIC_PRIORITY(8) | DMA_DISDEBUG;  // Sets A
 dma_reg->cs |= DMA_WAIT_ON_WRITES | DMA_ACTIVE; // Start DMA transfer
 ```
 
-You could find code until now in[ `dma-unpaced.c`](./dma-unpaced.c). Now that the DMA starts, we could see the results of 20 consecutive fetches to the system timer. On my RPi, the output happens to be: 
+You could find code until now in[ `dma-unpaced.c`](./dma-unpaced.c). Now that the DMA starts, we could see the results of 20 consecutive fetches to the system timer. On my Pi, the output happens to be: 
 
 ``` 
 $ sudo ./dma-unpaced
@@ -224,8 +226,9 @@ Now compile this code with `make dma-demo`  and run with `sudo ./dma-demo`, then
 >>> pi.write(4, 0)
 ```
 
-You could see that the level changes are detected immediately as you type in the python commands. Also check `htop` and you will see that the CPU usage of our demo program is just as low as around **20%**.With a lower sample rate like 5us, the CPU usage is almost negligible.
+You could see that the level changes are detected immediately as you type in the python commands. Also check `htop` and you will see that the CPU usage of our demo program is just as low as around **20%**. With a lower sample rate like 5us, the CPU usage is almost negligible.
 
 ## Conlusions and References
 
-As is mentioned at beginning of this article, there are lots of great code examples that use DMA. [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) is the one that use most, and it provides DMA memory allocation implementaions using both `pagemap` and mailbox, as well as DMA delay implementations with both PCM and PWM. 
+As is mentioned at beginning of this article, there are lots of great code examples that use DMA. [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) is the one that use most, and it provides DMA memory allocation implementaions using both `pagemap` and mailbox, as well as DMA delay implementations with both PCM and PWM. I haven't used [ServoBlaster](https://github.com/richardghirst/PiBits/tree/master/ServoBlaster) before, but it is probably the first to use PWM to generate accurate DMA delay. [Wallacoloo's example](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example) (a bit outdated) and [hezller's demo](https://github.com/hzeller/rpi-gpio-dma-demo) are also great references.
+
