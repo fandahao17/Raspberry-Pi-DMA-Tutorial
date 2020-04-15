@@ -18,7 +18,7 @@ The BCM2835 has 16 DMA channels. The *DMA channel controller registers* start at
 
 The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the pivot being *DMA channel controller registers*. Note that all "pointer"s in the following image are **bus address**es.
 
-![Screen Shot 2020-04-12 at 3.44.00 PM](img/dma_demo.png)
+<img src="./img/dma_demo.png">
 
 Detailed information about the DMA controller can be found in the datasheet.
 
@@ -90,7 +90,7 @@ dma_reg->cs |= DMA_WAIT_ON_WRITES | DMA_ACTIVE; // Start DMA transfer
 You could find code until now in[ `dma-unpaced.c`](./dma-unpaced.c). Now that the DMA starts, we could see the results of 20 consecutive fetches to the system timer. On my RPi, the output happens to be: 
 
 ``` 
-$ ./dma-unpaced
+$ sudo ./dma-unpaced
 Init: 20 cbs, 20 ticks
 DMA 0: 1616166277
 DMA 1: 1616166277
@@ -124,7 +124,7 @@ You could see that exactly what data to be sent to the PWM FIFO doesn't really m
 
 In my example, I choose the 500-MHz **PLLD** here as our PWM clock source, as it's [unlikely to change](https://raspberrypi.stackexchange.com/questions/1153/what-are-the-different-clock-sources-for-the-general-purpose-clocks). I divide it by *5* to get a 100-Mhz clock and set `range` field of PWM controller to *100* so it takes 100 cycles to send the data, which yields a total duration of 1us. 
 
-![dma-delay](img/dma_delay.png)
+<img src="./img/dma_delay.png" width="500">
 
 Here is a simplified version of the code used to control the PWM, note that I have omitted the code to enable the clock and PWM controller.
 
@@ -138,7 +138,7 @@ pwm_reg->range1 = 100 * 1; // Send for 100 cycles
 Configuring the "delay" control block is roughly the same as before, except the following field: 
 
 ``` c
-cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5); // Configure for DREQ
+cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5); // Tell DMA to use DREQ
 cb->src = ith_cb_bus_addr(0); // Dummy data
 cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO * 4; // Send to PWM FIFO
 ```
@@ -146,7 +146,7 @@ cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO * 4; // Send to PWM FIFO
 The complete code with paced DMA accesses can be found in [dma-paced.c](./dma-paced.c). You can `make paced` and run the program yields this output on my Pi:
 
 ```
-$ ./dma-paced
+$ sudo ./dma-paced
 Init: 40 cbs, 20 ticks
 DMA 0: 2855359907
 DMA 1: 2855359908
@@ -172,5 +172,60 @@ DMA 19: 2855359906
 
 We could see that the DMA accesses are done every microsecond, cool!
 
-## Final example: Monitoring GPIO changes at the us-level accuracy
+## Final example: us-level GPIO monitoring
 
+Now that we've paced our DMA accesses at a fixed sampling rate, we could do something more useful than checking the system timer. In this final example, I present a demo that uses literally the same DMA technique introduced in last section to watch the levels of GPIO 0-27 every microsecond and on detected level change, report the new GPIO levels as well as when (in us) the level change took place. The code can be found at [dma-demo.c](./dma-demo.c).
+
+A main loop is waked up every 5 ms to process those GPIO levels that has been recently sampled into the ring buffer. In case the process would be switched out by the Linux scheduler for a long time, I allocated a huge buffer that could store samples in the last 100 ms. The ring buffer is accessed in a straightforward way:
+
+``` c
+// `old_idx` is the index of the latest `level` entry we have processed
+// `cur_idx` is the index of the latest `level` entry the DMA engine have sampled
+while (1)
+{
+     // Get current DMA CB index in dma_reg->cb_addr, then calculate the current level entry index
+    cur_idx = get_cur_level_idx();
+    while (old_idx != cur_idx)
+    {
+        uint32_t level = *ith_level_virt_addr(old_idx) & ~0xF0000000; // Only GPIO 0-27
+        if (level != cur_level)
+        {
+            fprintf(stderr, "Level change @%u: %08X\n", cur_time, level);
+            cur_level = level;
+        }
+        cur_time += CLK_MICROS; // It will wrap around itself
+        old_idx = (old_idx + 1) % LEVEL_CNT; // LEVEL_CNT is total num of samples in the buffer
+    }
+    usleep(SLEEP_TIME_MILLIS * 1000); // SLEEP_TIME_MILLIS is 5, but could be smaller
+}
+```
+
+I noticed that in one second, the cumulative error of PWM-generated delays could be **more than ten microseconds**. So I inserted one timestamp,i.e, one DMA access to the system timer, after every 50 accesses to the GPIO level register to correct this error, making my `DMAResultPage` like this:
+
+``` c
+#define TIMESTAMPS_PER_PAGE 20
+#define LEVELS_PER_PAGE 1000
+#define PADDINGS_PER_PAGE 4
+
+typedef struct DMAResultPage
+{
+    uint32_t timestamps[TIMESTAMPS_PER_PAGE];
+    uint32_t levels[LEVELS_PER_PAGE];
+    uint32_t padding[PADDINGS_PER_PAGE];
+} DMAResultPage
+```
+
+Now compile this code with `make dma-demo`  and run with `sudo ./dma-demo`, then if you have pigpio installed, open another terminal and try toggling one of the GPIOs:
+
+``` python
+>>> import pigpio
+>>> pi = pigpio.pi()
+>>> pi.write(4, 1)
+>>> pi.write(4, 0)
+```
+
+You could see that the level changes are detected immediately as you type in the python commands. Also check `htop` and you will see that the CPU usage of our demo program is just as low as around **20%**.With a lower sample rate like 5us, the CPU usage is almost negligible.
+
+## Conlusions and References
+
+As is mentioned at beginning of this article, there are lots of great code examples that use DMA. [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) is the one that use most, and it provides DMA memory allocation implementaions using both `pagemap` and mailbox, as well as DMA delay implementations with both PCM and PWM. 
