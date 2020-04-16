@@ -1,28 +1,30 @@
 # A simple tutorial on using Raspberry Pi DMA channels
 
-Suppose you need to monitor the level changes of your Pi's GPIOs and report them as soon as possible. This could be as simple as a single *interrupt* if you are programming on *bare metal*. However, things are much more complicated if you are working on Pi's Linux system with tens of other processes running. To avoid your program from occupying all the CPU cycles, you need to use **DMA**.
+I found that there actually exists very few tutorial-like resources on how to use Raspberry Pi's DMA channel properly. There are some code examples, but they take time to read and may be tough for beginners to understand.
 
-I found that there actually exists very few tutorial-like resources on how to use Raspberry Pi's DMA channel properly. So I wrote this article for those who need to control DMA channels themselves, or (like me) are just curious about how great tools like [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) achieves high-speed sampling while consuming surprisingly low CPU resources. I'm not an expert in Raspberry Pi, so I **welcome any comments or suggestions** so I can improve this tutorial.
+So I wrote this article for those who need to control DMA channels themselves, or (like me) are just curious about how great tools like [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) achieves high-speed sampling while consuming surprisingly low CPU resources. I'm not an expert in Raspberry Pi, so I **welcome any comments or suggestions** so that I can improve this tutorial.
 
-**In this tutorial**, we will first control the DMA to continuously fetch the BCM2835 system timer, then we will pace DMA accesses with the PWM peripheral so we can designate a fixed DMA sample rate. I choose the system timer here because it increments every microsecond, so we can easily check whether our code is working correctly. Finally, I'm going to present a demo that uses DMA to monitor GPIO level changes at the accuracy of 1 us.
+**In this tutorial**, we will first control the DMA to continuously fetch the BCM2835 **system timer**, then we attempt to pace DMA accesses with the PWM peripheral so we can designate a fixed sample rate. I choose the system timer here because it increments every microsecond, so we can easily check whether our code is working correctly. Finally, I'm going to present a demo that uses DMA to monitor GPIO level changes at the accuracy of 1 us.
+
+I tested my code on my Raspberry Pi 3 B+, but it seems that the only difference across models is the base address of peripherals. Although this article focuses on sampling (**reading**), it should be as simple as swapping `src` and `dest` to let the data flow reversely.
 
 ## Background knowledge
 
 As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf) (the "*datasheet*"), There are three types of addresses in Raspberry Pi:
 
 * *ARM Virtual Address*: The address used in the virtual address space of a Linux process.
-* *ARM Physical Address*: The address used when accessing RAM. Since peripherals on BCM2835 are [memory-mapped](https://en.wikipedia.org/wiki/Memory-mapped_I/O), this address is used to access peripherals directly.
+* *ARM Physical Address*: The address used when accessing physical memory. Since peripherals on BCM2835 are [memory-mapped](https://en.wikipedia.org/wiki/Memory-mapped_I/O), this address is used to access peripherals directly.
 * *Bus Address*: This is the address used by the DMA engine.
 
-Note that the *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*, like this which we'll use later:
+The *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*. We can convert between them like this:
 
 ``` c
 #define BUS_TO_PHYS(x) ((x) & ~0xC0000000
 ```
 
-The BCM2835 has 16 DMA channels. The *DMA channel controller registers* start at *bus address* 0x7E007000, with adjacent channels offset by 0x100. Detailed information about the DMA controller can be found in the *datasheet*.
+The BCM2835 has 16 **DMA** channels. The *DMA channel controller registers* start at *bus address* 0x7E007000, with adjacent channels offset by 0x100. Detailed information about the DMA controller can be found in Section 4 of the *datasheet*.
 
-The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the pivot being *DMA channel controller registers*. Note that all "pointer"s in the following image are **bus address**es.
+The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the **sentinel** being *DMA channel controller registers*. When DMA starts working, the `cb_addr` field is **updated** after each DMA transfer so it always point to the current control block. Note that all "pointer"s in the following graph are **bus address**es. The exact meaning of these registers are documented in Section 4.2.1 in the *datasheet*.
 
 <img src="./img/dma_demo.png">
 
@@ -30,11 +32,13 @@ The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the p
 
 As metioned above, peripherals can be accessed by user programs with their *physical address*. In order to configure the DMA channel, we need to bring the DMA controller registers into *virtual memory*.
 
-The way we access these memory-mapped peripherals is to `mmap` them from the `/dev/mem` interface. We can wrap this procedure inside a function, note that I omitted error handling code here for clarity.
+The way we access these memory-mapped peripherals is to `mmap` them from the `/dev/mem` device, which is an image of main memory. We can wrap this procedure in a function, note that I omitted error handling code here for clarity.
 
 ``` c
 void *map_peripheral(uint32_t peri_offset, uint32_t size)
 {
+    // Error handling omitted for clarity, see full code in dma-unpaced.c
+  
     // Check mem(4) man page for "/dev/mem"
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
 
@@ -52,11 +56,11 @@ void *map_peripheral(uint32_t peri_offset, uint32_t size)
 }
 ```
 
-With this defined, we can define. Also, remember to use [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming)) when accessing peripherals!
+With this defined, we can easily obtain pointers to peripherals. Also, remember to use [`volatile`](https://en.wikipedia.org/wiki/Volatile_(computer_programming)) when accessing peripherals!
 
 ``` c
 volatile uint8_t *dma_base_ptr = map_peripheral(DMA_BASE, PAGE_SIZE);
-// We use DMA channel 5 here, a little pointer arithmetic is required
+// We use DMA channel 5 here, so a little pointer arithmetic is required
 volatile dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x100);
 ```
 
@@ -82,8 +86,9 @@ typedef struct DMAMemHandle
 I've included a mailbox implementation in this repository, with which we can implement `malloc` and `free`-like memory management. You may need to check its **permissive** license if you are to use it.
 
 ``` c
-// `int mailbox_fd = mbox_open()` somewhere else
-DMAMemHandle dma_malloc(unsigned int size
+// mailbox_fd initialized with mbox_open()
+
+DMAMemHandle dma_malloc(unsigned int size)
 {
     // Error handling code omitted, see dma-unpaced.c for full code
     DMAMemHandle page;
@@ -104,12 +109,11 @@ void dma_free(DMAMemHandle *page)
 }
 ```
 
-## Starting DMA transfer 
-
 As the mailbox `mem_alloc` function requires alignment by page, I specified the page structure for my control blocks and result buffer:
 
 ``` c
 #define PAGE_SIZE 4096 // Normal page size of Pi
+
 typedef struct DMACbPage
 {
     DMAControlBlock cbs[PAGE_SIZE / sizeof(DMAControlBlock)];
@@ -121,7 +125,9 @@ typedef struct DMAResultPage
 } DMAResultPage;
 ```
 
-This definition allows us to get the *virtual* or *bus address* of the `ith` control block through *C struct indexing*.
+## Starting DMA transfer 
+
+The above definition allows us to get the *virtual* or *bus address* of the *ith* control block easily through *C struct indexing*.
 
 ``` c
 static inline DMAControlBlock *ith_cb_virt_addr(int i)
@@ -151,7 +157,7 @@ cb->tx_len = 4; // 32 bits = 4 bytes
 cb->next_cb = ith_cb_bus_addr((i + 1) % NUM_CBS);  // A circular list here to do DMA forever
 ```
 
-After that, let the *DMA controller register* (the "pivot") to point to the first *DMA control block* and set the `active` bit in the `CS` field to start DMA transfer.
+After that, let the *DMA controller register* to point to the first *DMA control block* and set the `active` bit in the `CS` field to start DMA transfer.
 
 ``` c
 dma_reg->cb_addr = ith_cb_bus_addr(0); // Point to the first control block
@@ -190,11 +196,11 @@ DMA 19: 1616166277
 
 It seems that the speed of DMA accesses to the system timer is about *4~5 MHZ*, which is decent. However, most of the times we hope to do DMA accesses **at timed intervals**, so we can control the DMA *sampling rate* (or *write speed* for output). Fortunately, we could pace DMA accesses with the **DREQ** mechanism (documented in Section 4.2.1.3 in the *datasheet*), although it's a little tricky.
 
-We do this by inserting a "delay" block between two DMA "acesses" blocks. **The idea is**: the "delay" block controls the DMA engine to feed some dummy data to the **PWM** FIFO, then the PWM controller reads from its FIFO and "sends" this data out. The DMA engine keeps waiting until the PWM finishes sending and sets the *DREQ* signal to high. As we could control the number of *clock cycles* the PWM controller takes to send the data, we could delay the DMA engine for the duration we want.
+We do this by inserting a "delay" block between two DMA "acesses" blocks. **The idea is**: the "delay" block invokes a DMA write to the **PWM** FIFO, then the PWM controller reads from its FIFO and "sends" this data out. The DMA engine keeps waiting until the PWM finishes sending and sets the *DREQ* signal to high. As we could control the number of *clock cycles* the PWM controller spend sending the data, we could delay the DMA engine for the duration we want.
 
-You could see that exactly what data to be sent to the PWM FIFO doesn't really matter. *We just use PWM to generate an accurate delay*. If you are unclear of how the PWM controller works, check Section 9.4 of the *datasheet*. Also note that **PCM** can do basically the same thing, but we'll use PWM for this tutorial. Another thing to notice is that the *clock* metioned last paragraph is the clock generated by the **clock manager**. Check *Section 6.3* of the *datasheet* for more information. 
+You could see that exactly what data to be sent to the PWM FIFO doesn't really matter. We just use PWM to *generate an accurate delay*. If you are unclear of how the PWM controller works, check Section 9.4 of the *datasheet*. Also note that **PCM** can basically do the same thing, but we'll use PWM for this tutorial. Another thing to notice is that the *clock* mentioned last paragraph is the clock generated by the **clock manager**, which is documented in *Section 6.3* of the *datasheet* . I recommend also checking [here](https://elinux.org/BCM2835_registers#CM) for its register mappings.
 
-In my example, I choose the 500-MHz **PLLD** here as our PWM clock source, as it's [unlikely to change](https://raspberrypi.stackexchange.com/questions/1153/what-are-the-different-clock-sources-for-the-general-purpose-clocks). I divide it by *5* to get a 100-Mhz clock and set `range` field of PWM controller to *100* so it takes 100 cycles to send the data, which yields a total duration of 1us. 
+In my example, I choose the 500-MHz **PLLD** here as our PWM clock source, as it's [unlikely to change](https://raspberrypi.stackexchange.com/questions/1153/what-are-the-different-clock-sources-for-the-general-purpose-clocks) across models. I divide it by *5* to get a 100-Mhz clock and set `range` field of PWM controller to *100* so it takes 100 clock cycles to send the data, which yields a total duration of **1 us**. 
 
 <img src="./img/dma_delay.png" width="500">
 
@@ -204,7 +210,7 @@ Here is a simplified version of the code used to control the PWM, note that I ha
 clk_reg[CLK_PWMCTL] = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD); // Clock source 
 clk_reg[CLK_PWMDIV] = BCM_PASSWD | CLK_DIV_DIVI(5); // Divide by 5, 100 Mhz now
 
-pwm_reg->range1 = 100 * 1; // Send for 100 cycles
+pwm_reg->range1 = 100 * 1; // Sending for 100 cycles
 ```
 
 Configuring the "delay" control block is roughly the same as before, except for the following fields: 
@@ -242,7 +248,7 @@ DMA 18: 2855359905
 DMA 19: 2855359906
 ```
 
-We could see that the DMA accesses are done every microsecond, cool!
+We could see that the DMA accesses are done precisely every microsecond, cool!
 
 ## Final example: us-level GPIO monitoring
 
@@ -251,12 +257,11 @@ Now that we've paced our DMA accesses at a fixed sampling rate, we could do some
 A main loop is waked up every 5 ms to process those GPIO levels that has been recently sampled into the ring buffer. In case the process would be switched out by the Linux scheduler for a long time, I allocated a huge buffer that could store samples in the last 100 ms. The ring buffer is accessed in a straightforward way:
 
 ``` c
-// `old_idx` is the index of the latest `level` entry we have processed
-// `cur_idx` is the index of the latest `level` entry the DMA engine have sampled
+// `old_idx` is the index of the latest `level` record we have processed
+// `cur_idx` is the index of the latest `level` record the DMA engine have sampled
 while (1)
 {
-     // Get current DMA CB index in dma_reg->cb_addr, then calculate the current level entry index
-    cur_idx = get_cur_level_idx();
+    cur_idx = get_cur_level_idx(); // We can caluculate the current level record index by current DMA CB index
     while (old_idx != cur_idx)
     {
         uint32_t level = *ith_level_virt_addr(old_idx) & ~0xF0000000; // Only GPIO 0-27
@@ -296,9 +301,9 @@ Now compile this code with `make dma-demo`  and run with `sudo ./dma-demo`, then
 >>> pi.write(4, 0)
 ```
 
-You could see that the level changes are detected immediately as you type in the python commands. Also check `htop` and you will see that the CPU usage of our demo program is just as low as around **20%**. With a lower sample rate like 5 us, the CPU usage is almost negligible.
+You could see that the level changes are detected immediately as you type in the python commands! Also check `htop` and on my machine, the CPU usage of our demo program is just as low as around **20%**. With a lower sample rate like 5 us, the CPU usage is almost negligible.
 
 ## Conlusions and References
 
-As is mentioned at beginning of this article, there are lots of great code examples that use DMA. [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) is the one that use most, and it provides DMA memory allocation implementaions using both `pagemap` and mailbox, as well as DMA delay implementations with both PCM and PWM. I haven't used [ServoBlaster](https://github.com/richardghirst/PiBits/tree/master/ServoBlaster) before, but it is probably the first to use PWM to generate accurate DMA delay, and [this stackoverflow post](https://stackoverflow.com/questions/50427275/raspberry-how-does-the-pwm-via-dma-work) may help you understand its code. [Wallacoloo's example](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example) (a bit outdated) and [hezller's demo](https://github.com/hzeller/rpi-gpio-dma-demo) are also great references.
+As is mentioned at beginning of this article, there are lots of great code examples that use DMA. [pigpio](http://abyz.me.uk/rpi/pigpio/index.html) is the one that use most, and it provides DMA memory allocation implementaions using both `pagemap` and mailbox, as well as DMA delay implementations with both PCM and PWM. I haven't used [ServoBlaster](https://github.com/richardghirst/PiBits/tree/master/ServoBlaster) before, but it is probably the first to use PWM to generate accurate DMA delay, and [this stackoverflow post](https://stackoverflow.com/questions/50427275/raspberry-how-does-the-pwm-via-dma-work) may help you understand its code. [Wallacoloo's example](https://github.com/Wallacoloo/Raspberry-Pi-DMA-Example) (a bit outdated) and [hezller's demo](https://github.com/hzeller/rpi-gpio-dma-demo) are also great references. The ideas in this article is largely based on the above resources and explained according to my own understanding.
 
