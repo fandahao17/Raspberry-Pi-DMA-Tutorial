@@ -96,7 +96,10 @@ For more information, please refer to <http://unlicense.org/>
 #define TICK_CNT 20
 #define CB_CNT TICK_CNT
 
-#define CLK_MICROS 5
+#define CBS_PER_PAGE (PAGE_SIZE / sizeof(DMAControlBlock))
+#define TICKS_PER_PAGE (PAGE_SIZE / sizeof(uint32_t))
+#define CB_PAGE_CNT 1
+#define RESULT_PAGE_CNT 1
 
 typedef struct DMACtrlReg
 {
@@ -117,12 +120,12 @@ typedef struct DMAControlBlock
 
 typedef struct DMACbPage
 {
-    DMAControlBlock cbs[CB_CNT];
+    DMAControlBlock cbs[CBS_PER_PAGE];
 } DMACbPage;
 
 typedef struct DMAResultPage
 {
-    uint32_t ticks[TICK_CNT];
+    uint32_t ticks[TICKS_PER_PAGE];
 } DMAResultPage;
 
 typedef struct DMAMemHandle
@@ -141,35 +144,33 @@ DMAMemHandle dma_malloc(unsigned int size)
 {
     if (mailbox_fd < 0)
     {
-        if ((mailbox_fd = mbox_open()) < 0)
-        {
-            fprintf(stderr, "Failed to open /dev/vcio\n");
-        }
+        mailbox_fd = mbox_open();
+        assert(mailbox_fd >= 0);
     }
 
     // Make `size` a multiple of PAGE_SIZE
     size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
-    DMAMemHandle page;
+    DMAMemHandle mem;
     // Documentation: https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
-    page.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
-    page.bus_addr = mem_lock(mailbox_fd, page.mb_handle);
-    page.virtual_addr = mapmem(BUS_TO_PHYS(page.bus_addr), size);
+    mem.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
+    mem.bus_addr = mem_lock(mailbox_fd, mem.mb_handle);
+    mem.virtual_addr = mapmem(BUS_TO_PHYS(mem.bus_addr), size);
 
-    // fprintf(stderr, "Alloc: %6u bytes;  %p (bus=0x%08x, phys=0x%08x)\n",
-    // size, page.virtual_addr, page.bus_addr, BUS_TO_PHYS(page.bus_addr));
-    return page;
+    assert(mem.bus_addr != 0);
+
+    return mem;
 }
 
-void dma_free(DMAMemHandle *page)
+void dma_free(DMAMemHandle *mem)
 {
-    if (page->virtual_addr == NULL)
+    if (mem->virtual_addr == NULL)
         return;
 
-    unmapmem(page->virtual_addr, PAGE_SIZE);
-    mem_unlock(mailbox_fd, page->mb_handle);
-    mem_free(mailbox_fd, page->mb_handle);
-    page->virtual_addr = NULL;
+    unmapmem(mem->virtual_addr, PAGE_SIZE);
+    mem_unlock(mailbox_fd, mem->mb_handle);
+    mem_free(mailbox_fd, mem->mb_handle);
+    mem->virtual_addr = NULL;
 }
 
 void *map_peripheral(uint32_t addr, uint32_t size)
@@ -202,28 +203,32 @@ void *map_peripheral(uint32_t addr, uint32_t size)
 
 void dma_alloc_pages()
 {
-    dma_cb_pages = dma_malloc(sizeof(DMACbPage));
-    dma_result_pages = dma_malloc(sizeof(DMAResultPage));
+    dma_cb_pages = dma_malloc(CB_PAGE_CNT * sizeof(DMACbPage));
+    dma_result_pages = dma_malloc(RESULT_PAGE_CNT * sizeof(DMAResultPage));
 }
 
 static inline DMAControlBlock *ith_cb_virt_addr(int i)
 {
-    return &((DMACbPage *)dma_cb_pages.virtual_addr)->cbs[i];
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return &((DMACbPage *)dma_cb_pages.virtual_addr)[page].cbs[index];
 }
 
 static inline uint32_t ith_cb_bus_addr(int i)
 {
-    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)->cbs[i];
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)[page].cbs[index];
 }
 
 static inline uint32_t *ith_tick_virt_addr(int i)
 {
-    return &((DMAResultPage *)dma_result_pages.virtual_addr)->ticks[i];
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].ticks[index];
 }
 
 static inline uint32_t ith_tick_bus_addr(int i)
 {
-    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)->ticks[i];
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].ticks[index];
 }
 
 void dma_init_cbs()
@@ -259,14 +264,14 @@ void dma_start()
 
 void dma_end()
 {
-    // Shutdown DMA channel.
+    // Shutdown DMA channel, otherwise it won't stop after program exits
     dma_reg->cs |= DMA_CHANNEL_ABORT;
     usleep(100);
     dma_reg->cs &= ~DMA_ACTIVE;
     dma_reg->cs |= DMA_CHANNEL_RESET;
     usleep(100);
 
-    // Release the memory used by DMA
+    // Release the memory used by DMA, otherwise the memory will be leaked after program exits
     dma_free(&dma_result_pages);
     dma_free(&dma_cb_pages);
 }

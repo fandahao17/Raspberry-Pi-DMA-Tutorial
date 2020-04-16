@@ -53,10 +53,9 @@ For more information, please refer to <http://unlicense.org/>
 #define GPLEV0 13
 #define GPIO_LEN 0xF4
 
-#define CLK_BASE 0x00101000
-#define CLK_LEN 0xA8
-#define CLK_PWMCTL 40
-#define CLK_PWMDIV 41
+#define CM_BASE 0x00101000
+#define CM_LEN 0xA8
+#define CM_PWM 0xA0
 #define CLK_CTL_BUSY (1 << 7)
 #define CLK_CTL_KILL (1 << 5)
 #define CLK_CTL_ENAB (1 << 4)
@@ -79,7 +78,6 @@ For more information, please refer to <http://unlicense.org/>
 #define PWM_BASE 0x0020C000
 #define PWM_LEN 0x28
 #define PWM_FIFO 6
-#define PWM_TIMER (((PWM_BASE + PWM_FIFO * 4) & 0x00ffffff) | PERI_BUS_BASE)
 
 /* PWM control bits */
 #define PWM_CTL 0
@@ -142,21 +140,22 @@ For more information, please refer to <http://unlicense.org/>
 #define MEM_FLAG_COHERENT (2 << 2)
 #define MEM_FLAG_L1_NONALLOCATING (MEM_FLAG_DIRECT | MEM_FLAG_COHERENT)
 
-#define TICKS_PER_PAGE 20
+#define TIMESTAMPS_PER_PAGE 20
 #define LEVELS_PER_PAGE 1000
 #define PADDINGS_PER_PAGE 4
 #define CBS_PER_PAGE (PAGE_SIZE / sizeof(DMAControlBlock))
-#define LEVELS_PER_TICK (LEVELS_PER_PAGE / TICKS_PER_PAGE)
+#define LEVELS_PER_TIMESTAMP (LEVELS_PER_PAGE / TIMESTAMPS_PER_PAGE)
 
 #define BUFFER_MS 100
 #define LEVEL_CNT (BUFFER_MS * (1000 / CLK_MICROS)) // Number of `level` entries in buffer
 #define RESULT_PAGE_CNT (LEVEL_CNT / LEVELS_PER_PAGE)
-#define TICK_CNT (RESULT_PAGE_CNT * TICKS_PER_PAGE)
+#define TIMESTAMP_CNT (RESULT_PAGE_CNT * TIMESTAMPS_PER_PAGE)
 #define DELAY_CNT LEVEL_CNT
-#define CB_CNT (LEVEL_CNT + TICK_CNT + DELAY_CNT)
+#define CB_CNT (LEVEL_CNT + TIMESTAMP_CNT + DELAY_CNT)
 #define CB_PAGE_CNT ((CB_CNT + CBS_PER_PAGE - 1) / CBS_PER_PAGE)
 
-#define CLK_MICROS 5
+#define CLK_DIVI 5
+#define CLK_MICROS 1
 #define SLEEP_TIME_MILLIS 5
 
 typedef struct DMACtrlReg
@@ -183,7 +182,7 @@ typedef struct DMACbPage
 
 typedef struct DMAResultPage
 {
-    uint32_t ticks[TICKS_PER_PAGE];
+    uint32_t timestamps[TIMESTAMPS_PER_PAGE];
     uint32_t levels[LEVELS_PER_PAGE];
     uint32_t padding[PADDINGS_PER_PAGE];
 } DMAResultPage;
@@ -194,6 +193,12 @@ typedef struct DMAMemHandle
     uint32_t bus_addr;  // Bus adress of the page, this is not a pointer because it does not point to valid virtual address
     uint32_t mb_handle; // Used by mailbox property interface
 } DMAMemHandle;
+
+typedef struct CLKCtrlReg
+{
+    uint32_t ctrl;
+    uint32_t div;
+} CLKCtrlReg;
 
 typedef struct PWMCtrlReg
 {
@@ -214,41 +219,39 @@ DMAMemHandle dma_cb_pages;
 DMAMemHandle dma_result_pages;
 volatile DMACtrlReg *dma_reg;
 volatile PWMCtrlReg *pwm_reg;
-volatile uint32_t *clk_reg;
+volatile CLKCtrlReg *clk_reg;
 
 DMAMemHandle dma_malloc(unsigned int size)
 {
     if (mailbox_fd < 0)
     {
-        if ((mailbox_fd = mbox_open()) < 0)
-        {
-            fprintf(stderr, "Failed to open /dev/vcio\n");
-        }
+        mailbox_fd = mbox_open();
+        assert(mailbox_fd >= 0);
     }
 
     // Make `size` a multiple of PAGE_SIZE
     size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
-    DMAMemHandle page;
+    DMAMemHandle mem;
     // Documentation: https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
-    page.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
-    page.bus_addr = mem_lock(mailbox_fd, page.mb_handle);
-    page.virtual_addr = mapmem(BUS_TO_PHYS(page.bus_addr), size);
+    mem.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
+    mem.bus_addr = mem_lock(mailbox_fd, mem.mb_handle);
+    mem.virtual_addr = mapmem(BUS_TO_PHYS(mem.bus_addr), size);
 
-    // fprintf(stderr, "Alloc: %6u bytes;  %p (bus=0x%08x, phys=0x%08x)\n",
-    // size, page.virtual_addr, page.bus_addr, BUS_TO_PHYS(page.bus_addr));
-    return page;
+    assert(mem.bus_addr != 0);
+
+    return mem;
 }
 
-void dma_free(DMAMemHandle *page)
+void dma_free(DMAMemHandle *mem)
 {
-    if (page->virtual_addr == NULL)
+    if (mem->virtual_addr == NULL)
         return;
 
-    unmapmem(page->virtual_addr, PAGE_SIZE);
-    mem_unlock(mailbox_fd, page->mb_handle);
-    mem_free(mailbox_fd, page->mb_handle);
-    page->virtual_addr = NULL;
+    unmapmem(mem->virtual_addr, PAGE_SIZE);
+    mem_unlock(mailbox_fd, mem->mb_handle);
+    mem_free(mailbox_fd, mem->mb_handle);
+    mem->virtual_addr = NULL;
 }
 
 void *map_peripheral(uint32_t addr, uint32_t size)
@@ -297,16 +300,16 @@ static inline uint32_t ith_cb_bus_addr(int i)
     return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)[page].cbs[index];
 }
 
-static inline uint32_t *ith_tick_virt_addr(int i)
+static inline uint32_t *ith_timestamp_virt_addr(int i)
 {
-    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
-    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].ticks[index];
+    int page = i / TIMESTAMPS_PER_PAGE, index = i % TIMESTAMPS_PER_PAGE;
+    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].timestamps[index];
 }
 
-static inline uint32_t ith_tick_bus_addr(int i)
+static inline uint32_t ith_timestamp_bus_addr(int i)
 {
-    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
-    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].ticks[index];
+    int page = i / TIMESTAMPS_PER_PAGE, index = i % TIMESTAMPS_PER_PAGE;
+    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].timestamps[index];
 }
 
 static inline uint32_t *ith_level_virt_addr(int i)
@@ -323,24 +326,24 @@ static inline uint32_t ith_level_bus_addr(int i)
 
 void dma_init_cbs()
 {
-    int tick_idx = 0, level_idx = 0, cb_idx = 0;
+    int timestamp_idx = 0, level_idx = 0, cb_idx = 0;
     DMAControlBlock *cb;
-    for (tick_idx = 0; tick_idx < TICK_CNT; tick_idx++)
+    for (timestamp_idx = 0; timestamp_idx < TIMESTAMP_CNT; timestamp_idx++)
     {
         // As time goes on, the cumulative error of PWM-paced delays may become large,
-        // so we insert one access to system timer every `LEVELS_PER_TICK` accesses
+        // so we insert one access to system timer every `LEVELS_PER_TIMESTAMP` accesses
         // to GPIO in order to correct this error
 
-        // Tick block
+        // timestamp block
         cb = ith_cb_virt_addr(cb_idx);
         cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
         cb->src = PERI_BUS_BASE + SYST_BASE + SYST_CLO * 4;
-        cb->dest = ith_tick_bus_addr(tick_idx);
+        cb->dest = ith_timestamp_bus_addr(timestamp_idx);
         cb->tx_len = 4;
         cb_idx = (cb_idx + 1) % CB_CNT;
         cb->next_cb = ith_cb_bus_addr(cb_idx);
 
-        for (int i = 0; i < LEVELS_PER_TICK; i++)
+        for (int i = 0; i < LEVELS_PER_TIMESTAMP; i++)
         {
             // Level block
             cb = ith_cb_virt_addr(cb_idx);
@@ -355,45 +358,43 @@ void dma_init_cbs()
             cb = ith_cb_virt_addr(cb_idx);
             cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
             cb->src = ith_cb_bus_addr(0);
-            cb->dest = PWM_TIMER;
+            cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO * 4;
             cb->tx_len = 4;
             cb_idx = (cb_idx + 1) % CB_CNT;
             cb->next_cb = ith_cb_bus_addr(cb_idx);
         }
     }
-    fprintf(stderr, "Init: %d cbs, %d levels, %d ticks\n", CB_CNT, LEVEL_CNT, TICK_CNT);
+    fprintf(stderr, "Init: %d cbs, %d levels, %d timestamps\n", CB_CNT, LEVEL_CNT, TIMESTAMP_CNT);
 }
 
 void init_hw_clk()
 {
     // See Chanpter 6.3, BCM2835 ARM peripherals for controlling the hardware clock
+    // Also check https://elinux.org/BCM2835_registers#CM for the register mapping
 
     // kill the clock if busy
-    size_t clkCtl = CLK_PWMCTL, clkDiv = CLK_PWMDIV, divI = 5;
-    if (clk_reg[clkCtl] & CLK_CTL_BUSY)
+    if (clk_reg->ctrl & CLK_CTL_BUSY)
     {
         do
         {
-            clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_KILL;
-        } while (clk_reg[clkCtl] & CLK_CTL_BUSY);
+            clk_reg->ctrl = BCM_PASSWD | CLK_CTL_KILL;
+        } while (clk_reg->ctrl & CLK_CTL_BUSY);
     }
 
-    // The original clock speed is 500MHZ, we divide it by 5 to get a 100MHZ clock
-    clk_reg[clkDiv] = BCM_PASSWD | CLK_DIV_DIVI(divI);
+    // Set clock source to plld
+    clk_reg->ctrl = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
     usleep(10);
 
-    // Set clock source to plld
-    clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
+    // The original clock speed is 500MHZ, we divide it by 5 to get a 100MHZ clock
+    clk_reg->div = BCM_PASSWD | CLK_DIV_DIVI(CLK_DIVI);
     usleep(10);
 
     // Enable the clock
-    clk_reg[clkCtl] |= (BCM_PASSWD | CLK_CTL_ENAB);
+    clk_reg->ctrl |= (BCM_PASSWD | CLK_CTL_ENAB);
 }
 
-void dma_init_clock()
+void init_pwm()
 {
-    init_hw_clk();
-
     // reset PWM
     pwm_reg->ctrl = 0;
     usleep(10);
@@ -456,34 +457,34 @@ static inline uint32_t get_cur_level_idx()
     uint32_t cb = (dma_reg->cb_addr - dma_cb_pages.bus_addr) / sizeof(DMAControlBlock);
 
     // Which `level` entry are we sampling?
-    uint32_t block = cb / (1 + 2 * LEVELS_PER_TICK);
-    uint32_t index = cb % (1 + 2 * LEVELS_PER_TICK);
-    return block * LEVELS_PER_TICK + (index > 1 ? index - 1 : index) / 2;
+    uint32_t block = cb / (1 + 2 * LEVELS_PER_TIMESTAMP);
+    uint32_t index = cb % (1 + 2 * LEVELS_PER_TIMESTAMP);
+    return block * LEVELS_PER_TIMESTAMP + (index > 1 ? index - 1 : index) / 2;
 }
 
 void monitor_gpios()
 {
-    printf("Enter thread\n");
+    printf("Press Ctrl-C to end the program!\n");
     uint32_t cur_level = 0, cur_idx, old_idx = 0, cur_time = 0;
     while (1)
     {
         cur_idx = get_cur_level_idx();
 
         // `old_idx` is the index of `level` entry we have processed
-        // `new_idx` is the index of `level` entry the DMA engine have sampled
+        // `cur_idx` is the index of `level` entry the DMA engine have sampled
         while (old_idx != cur_idx)
         {
-            if (old_idx % LEVELS_PER_TICK == 0)
+            if (old_idx % LEVELS_PER_TIMESTAMP == 0)
             {
                 // As time goes on, the cumulative error of PWM-paced delays may become large,
-                // so we insert one access to system timer every `LEVELS_PER_TICK` accesses
+                // so we insert one access to system timer every `LEVELS_PER_TIMESTAMP` accesses
                 // to GPIO in order to correct this error
-                cur_time = *ith_tick_virt_addr(old_idx / LEVELS_PER_TICK);
+                cur_time = *ith_timestamp_virt_addr(old_idx / LEVELS_PER_TIMESTAMP);
             }
             uint32_t level = *ith_level_virt_addr(old_idx) & ~0xF0000000;
             if (level != cur_level)
             {
-                fprintf(stderr, "Level change @%u: %08X\n", cur_time, level);
+                printf("Level change @%u: %08X\n", cur_time, level);
                 cur_level = level;
             }
             cur_time += CLK_MICROS; // It will wrap around itself
@@ -497,6 +498,7 @@ void sigint_handler(int signo)
 {
     if (signo == SIGINT)
     {
+        // Release the resources properly
         fprintf(stderr, "Ending GPIO monitoring!\n");
         dma_end();
         exit(0);
@@ -511,7 +513,9 @@ int main()
     dma_reg = (DMACtrlReg *)(dma_base_ptr + DMA_CHANNEL * 0x100);
 
     pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
-    clk_reg = map_peripheral(CLK_BASE, CLK_LEN);
+
+    uint8_t *cm_base_ptr = map_peripheral(CM_BASE, CM_LEN);
+    clk_reg = (CLKCtrlReg *)(cm_base_ptr + CM_PWM);
 
     dma_alloc_pages();
     usleep(100);
@@ -519,7 +523,10 @@ int main()
     dma_init_cbs();
     usleep(100);
 
-    dma_init_clock();
+    init_hw_clk();
+    usleep(100);
+
+    init_pwm();
     usleep(100);
 
     dma_start();

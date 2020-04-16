@@ -53,10 +53,9 @@ For more information, please refer to <http://unlicense.org/>
 #define GPLEV0 13
 #define GPIO_LEN 0xF4
 
-#define CLK_BASE 0x00101000
-#define CLK_LEN 0xA8
-#define CLK_PWMCTL 40
-#define CLK_PWMDIV 41
+#define CM_BASE 0x00101000
+#define CM_LEN 0xA8
+#define CM_PWM 0xA0
 #define CLK_CTL_BUSY (1 << 7)
 #define CLK_CTL_KILL (1 << 5)
 #define CLK_CTL_ENAB (1 << 4)
@@ -79,7 +78,6 @@ For more information, please refer to <http://unlicense.org/>
 #define PWM_BASE 0x0020C000
 #define PWM_LEN 0x28
 #define PWM_FIFO 6
-#define PWM_TIMER (((PWM_BASE + PWM_FIFO * 4) & 0x00ffffff) | PERI_BUS_BASE)
 
 /* PWM control bits */
 #define PWM_CTL 0
@@ -145,6 +143,12 @@ For more information, please refer to <http://unlicense.org/>
 #define TICK_CNT 20
 #define CB_CNT (TICK_CNT * 2)
 
+#define CBS_PER_PAGE (PAGE_SIZE / sizeof(DMAControlBlock))
+#define TICKS_PER_PAGE (PAGE_SIZE / sizeof(uint32_t))
+#define CB_PAGE_CNT 1
+#define RESULT_PAGE_CNT 1
+
+#define CLK_DIVI 5
 #define CLK_MICROS 1
 
 typedef struct DMACtrlReg
@@ -166,12 +170,12 @@ typedef struct DMAControlBlock
 
 typedef struct DMACbPage
 {
-    DMAControlBlock cbs[CB_CNT];
+    DMAControlBlock cbs[CBS_PER_PAGE];
 } DMACbPage;
 
 typedef struct DMAResultPage
 {
-    uint32_t ticks[TICK_CNT];
+    uint32_t ticks[TICKS_PER_PAGE];
 } DMAResultPage;
 
 typedef struct DMAMemHandle
@@ -180,6 +184,12 @@ typedef struct DMAMemHandle
     uint32_t bus_addr;  // Bus adress of the page, this is not a pointer because it does not point to valid virtual address
     uint32_t mb_handle; // Used by mailbox property interface
 } DMAMemHandle;
+
+typedef struct CLKCtrlReg
+{
+    uint32_t ctrl;
+    uint32_t div;
+} CLKCtrlReg;
 
 typedef struct PWMCtrlReg
 {
@@ -200,41 +210,39 @@ DMAMemHandle dma_cb_pages;
 DMAMemHandle dma_result_pages;
 volatile DMACtrlReg *dma_reg;
 volatile PWMCtrlReg *pwm_reg;
-volatile uint32_t *clk_reg;
+volatile CLKCtrlReg *clk_reg;
 
 DMAMemHandle dma_malloc(unsigned int size)
 {
     if (mailbox_fd < 0)
     {
-        if ((mailbox_fd = mbox_open()) < 0)
-        {
-            fprintf(stderr, "Failed to open /dev/vcio\n");
-        }
+        mailbox_fd = mbox_open();
+        assert(mailbox_fd >= 0);
     }
 
     // Make `size` a multiple of PAGE_SIZE
     size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
-    DMAMemHandle page;
+    DMAMemHandle mem;
     // Documentation: https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
-    page.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
-    page.bus_addr = mem_lock(mailbox_fd, page.mb_handle);
-    page.virtual_addr = mapmem(BUS_TO_PHYS(page.bus_addr), size);
+    mem.mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
+    mem.bus_addr = mem_lock(mailbox_fd, mem.mb_handle);
+    mem.virtual_addr = mapmem(BUS_TO_PHYS(mem.bus_addr), size);
 
-    // fprintf(stderr, "Alloc: %6u bytes;  %p (bus=0x%08x, phys=0x%08x)\n",
-    // size, page.virtual_addr, page.bus_addr, BUS_TO_PHYS(page.bus_addr));
-    return page;
+    assert(mem.bus_addr != 0);
+
+    return mem;
 }
 
-void dma_free(DMAMemHandle *page)
+void dma_free(DMAMemHandle *mem)
 {
-    if (page->virtual_addr == NULL)
+    if (mem->virtual_addr == NULL)
         return;
 
-    unmapmem(page->virtual_addr, PAGE_SIZE);
-    mem_unlock(mailbox_fd, page->mb_handle);
-    mem_free(mailbox_fd, page->mb_handle);
-    page->virtual_addr = NULL;
+    unmapmem(mem->virtual_addr, PAGE_SIZE);
+    mem_unlock(mailbox_fd, mem->mb_handle);
+    mem_free(mailbox_fd, mem->mb_handle);
+    mem->virtual_addr = NULL;
 }
 
 void *map_peripheral(uint32_t addr, uint32_t size)
@@ -267,28 +275,32 @@ void *map_peripheral(uint32_t addr, uint32_t size)
 
 void dma_alloc_pages()
 {
-    dma_cb_pages = dma_malloc(sizeof(DMACbPage));
-    dma_result_pages = dma_malloc(sizeof(DMAResultPage));
+    dma_cb_pages = dma_malloc(CB_PAGE_CNT * sizeof(DMACbPage));
+    dma_result_pages = dma_malloc(RESULT_PAGE_CNT * sizeof(DMAResultPage));
 }
 
 static inline DMAControlBlock *ith_cb_virt_addr(int i)
 {
-    return &((DMACbPage *)dma_cb_pages.virtual_addr)->cbs[i];
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return &((DMACbPage *)dma_cb_pages.virtual_addr)[page].cbs[index];
 }
 
 static inline uint32_t ith_cb_bus_addr(int i)
 {
-    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)->cbs[i];
+    int page = i / CBS_PER_PAGE, index = i % CBS_PER_PAGE;
+    return (uint32_t) & ((DMACbPage *)(uintptr_t)dma_cb_pages.bus_addr)[page].cbs[index];
 }
 
 static inline uint32_t *ith_tick_virt_addr(int i)
 {
-    return &((DMAResultPage *)dma_result_pages.virtual_addr)->ticks[i];
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return &((DMAResultPage *)dma_result_pages.virtual_addr)[page].ticks[index];
 }
 
 static inline uint32_t ith_tick_bus_addr(int i)
 {
-    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)->ticks[i];
+    int page = i / TICKS_PER_PAGE, index = i % TICKS_PER_PAGE;
+    return (uint32_t) & ((DMAResultPage *)(uintptr_t)dma_result_pages.bus_addr)[page].ticks[index];
 }
 
 void dma_init_cbs()
@@ -308,7 +320,7 @@ void dma_init_cbs()
         cb = ith_cb_virt_addr(2 * i + 1);
         cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
         cb->src = ith_cb_bus_addr(0);
-        cb->dest = PWM_TIMER;
+        cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO * 4;
         cb->tx_len = 4;
         cb->next_cb = ith_cb_bus_addr((2 * i + 2) % CB_CNT);
     }
@@ -318,33 +330,31 @@ void dma_init_cbs()
 void init_hw_clk()
 {
     // See Chanpter 6.3, BCM2835 ARM peripherals for controlling the hardware clock
+    // Also check https://elinux.org/BCM2835_registers#CM for the register mapping
 
     // kill the clock if busy
-    size_t clkCtl = CLK_PWMCTL, clkDiv = CLK_PWMDIV, divI = 5;
-    if (clk_reg[clkCtl] & CLK_CTL_BUSY)
+    if (clk_reg->ctrl & CLK_CTL_BUSY)
     {
         do
         {
-            clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_KILL;
-        } while (clk_reg[clkCtl] & CLK_CTL_BUSY);
+            clk_reg->ctrl = BCM_PASSWD | CLK_CTL_KILL;
+        } while (clk_reg->ctrl & CLK_CTL_BUSY);
     }
 
-    // The original clock speed is 500MHZ, we divide it by 5 to get a 100MHZ clock
-    clk_reg[clkDiv] = BCM_PASSWD | CLK_DIV_DIVI(divI);
+    // Set clock source to plld
+    clk_reg->ctrl = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
     usleep(10);
 
-    // Set clock source to plld
-    clk_reg[clkCtl] = BCM_PASSWD | CLK_CTL_SRC(CLK_CTL_SRC_PLLD);
+    // The original clock speed is 500MHZ, we divide it by 5 to get a 100MHZ clock
+    clk_reg->div = BCM_PASSWD | CLK_DIV_DIVI(CLK_DIVI);
     usleep(10);
 
     // Enable the clock
-    clk_reg[clkCtl] |= (BCM_PASSWD | CLK_CTL_ENAB);
+    clk_reg->ctrl |= (BCM_PASSWD | CLK_CTL_ENAB);
 }
 
-void dma_init_clock()
+void init_pwm()
 {
-    init_hw_clk();
-
     // reset PWM
     pwm_reg->ctrl = 0;
     usleep(10);
@@ -389,14 +399,14 @@ void dma_start()
 
 void dma_end()
 {
-    // Shutdown DMA channel.
+    // Shutdown DMA channel, otherwise it won't stop after program exits
     dma_reg->cs |= DMA_CHANNEL_ABORT;
     usleep(100);
     dma_reg->cs &= ~DMA_ACTIVE;
     dma_reg->cs |= DMA_CHANNEL_RESET;
     usleep(100);
 
-    // Release the memory used by DMA
+    // Release the memory used by DMA, otherwise the memory will be leaked after program exits
     dma_free(&dma_result_pages);
     dma_free(&dma_cb_pages);
 }
@@ -407,7 +417,9 @@ int main()
     dma_reg = (DMACtrlReg *)(dma_base_ptr + DMA_CHANNEL * 0x100);
 
     pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
-    clk_reg = map_peripheral(CLK_BASE, CLK_LEN);
+
+    uint8_t *cm_base_ptr = map_peripheral(CM_BASE, CM_LEN);
+    clk_reg = (CLKCtrlReg *)(cm_base_ptr + CM_PWM);
 
     dma_alloc_pages();
     usleep(100);
@@ -415,7 +427,10 @@ int main()
     dma_init_cbs();
     usleep(100);
 
-    dma_init_clock();
+    init_hw_clk();
+    usleep(100);
+
+    init_pwm();
     usleep(100);
 
     dma_start();
