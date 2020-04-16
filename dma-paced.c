@@ -49,10 +49,6 @@ For more information, please refer to <http://unlicense.org/>
 #define PERI_PHYS_BASE 0x3F000000
 #define BUS_TO_PHYS(x) ((x) & ~0xC0000000)
 
-#define GPIO_BASE 0x00200000
-#define GPLEV0 13
-#define GPIO_LEN 0xF4
-
 #define CM_BASE 0x00101000
 #define CM_LEN 0xA8
 #define CM_PWM 0xA0
@@ -77,7 +73,7 @@ For more information, please refer to <http://unlicense.org/>
 
 #define PWM_BASE 0x0020C000
 #define PWM_LEN 0x28
-#define PWM_FIFO 6
+#define PWM_FIFO 0x18
 
 /* PWM control bits */
 #define PWM_CTL 0
@@ -102,7 +98,7 @@ For more information, please refer to <http://unlicense.org/>
 
 #define SYST_BASE 0x3000
 #define SYST_LEN 0x1C
-#define SYST_CLO 1
+#define SYST_CLO 0x04
 
 #define DMA_BASE 0x00007000
 #define DMA_CHANNEL 6
@@ -173,6 +169,7 @@ typedef struct DMAMemHandle
 
 typedef struct CLKCtrlReg
 {
+    // See https://elinux.org/BCM2835_registers#CM
     uint32_t ctrl;
     uint32_t div;
 } CLKCtrlReg;
@@ -209,7 +206,7 @@ DMAMemHandle *dma_malloc(unsigned int size)
     // Make `size` a multiple of PAGE_SIZE
     size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
-    DMAMemHandle *mem = (DMAMemHandle *)malloc(size);
+    DMAMemHandle *mem = (DMAMemHandle *)malloc(sizeof(DMAMemHandle));
     // Documentation: https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
     mem->mb_handle = mem_alloc(mailbox_fd, size, PAGE_SIZE, MEM_FLAG_L1_NONALLOCATING);
     mem->bus_addr = mem_lock(mailbox_fd, mem->mb_handle);
@@ -262,7 +259,7 @@ void *map_peripheral(uint32_t addr, uint32_t size)
     return result;
 }
 
-void dma_alloc_pages()
+void dma_alloc_buffers()
 {
     dma_cbs = dma_malloc(CB_CNT * sizeof(DMAControlBlock));
     dma_ticks = dma_malloc(TICK_CNT * sizeof(uint32_t));
@@ -284,7 +281,7 @@ void dma_init_cbs()
         // Tick block
         cb = ith_cb_virt_addr(2 * i);
         cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
-        cb->src = PERI_BUS_BASE + SYST_BASE + SYST_CLO * 4;
+        cb->src = PERI_BUS_BASE + SYST_BASE + SYST_CLO;
         cb->dest = ith_tick_bus_addr(i);
         cb->tx_len = 4;
         cb->next_cb = ith_cb_bus_addr(2 * i + 1);
@@ -292,8 +289,8 @@ void dma_init_cbs()
         // Delay block
         cb = ith_cb_virt_addr(2 * i + 1);
         cb->tx_info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ | DMA_PERIPHERAL_MAPPING(5);
-        cb->src = ith_cb_bus_addr(0);
-        cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO * 4;
+        cb->src = ith_cb_bus_addr(0); // Dummy data
+        cb->dest = PERI_BUS_BASE + PWM_BASE + PWM_FIFO;
         cb->tx_len = 4;
         cb->next_cb = ith_cb_bus_addr((2 * i + 2) % CB_CNT);
     }
@@ -397,7 +394,7 @@ int main()
     uint8_t *cm_base_ptr = map_peripheral(CM_BASE, CM_LEN);
     clk_reg = (CLKCtrlReg *)(cm_base_ptr + CM_PWM);
 
-    dma_alloc_pages();
+    dma_alloc_buffers();
     usleep(100);
 
     dma_init_cbs();
@@ -420,7 +417,6 @@ int main()
         printf("DMA %d: %u\n", i, ticks[i]);
     }
 
-    // Should not reach here
     dma_end();
     return 0;
 }
