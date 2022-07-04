@@ -35,6 +35,7 @@ For more information, please refer to <http://unlicense.org/>
 #include <string.h>
 #include <sys/mman.h>
 #include <signal.h>
+#include <bcm_host.h>
 
 #include "mailbox.h"
 
@@ -258,7 +259,7 @@ void *map_peripheral(uint32_t addr, uint32_t size)
         PROT_READ | PROT_WRITE,
         MAP_SHARED,
         mem_fd,
-        PERI_PHYS_BASE + addr);
+        bcm_host_get_peripheral_address() + addr);
 
     close(mem_fd);
 
