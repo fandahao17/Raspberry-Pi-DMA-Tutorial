@@ -14,7 +14,7 @@ As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/upload
 
 * *ARM Virtual Address*: The address used in the [virtual address space](https://en.wikipedia.org/wiki/Virtual_address_space) of a Linux process.
 * *ARM Physical Address*: The address used when accessing physical memory. Since peripherals on BCM2835 are [memory-mapped](https://en.wikipedia.org/wiki/Memory-mapped_I/O), this address is used to access peripherals directly.
-* *Bus Address*: This is the address used by the DMA engine.
+* *Bus Address*: This is the address used by the DMA engine. A bus address is an address as seen by hardware peripherals.
 
 The *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*. We can convert between them like this:
 
@@ -30,7 +30,7 @@ The *DMA control blocks* on BCM2835 are organized as a *linked list*, with the *
 
 ## Mapping Peripherals into Virtual Memory
 
-The first thing is to get access to the peripherals. As memtioned above, peripherals can be accessed by user programs with their *physical address*. In order to configure the DMA channel, we need to bring the DMA controller registers into *virtual memory*.
+The first thing is to get access to the peripherals. As mentioned above, peripherals can be accessed by user programs with their *physical address*. In order to configure the DMA channel, we need to bring the DMA controller registers into *virtual memory*.
 
 The way we access these memory-mapped peripherals is to `mmap` them from the `/dev/mem` device, which is an image of main memory. I wrapped this procedure in a function, note that I omitted error handling code here for clarity.
 
@@ -68,7 +68,7 @@ volatile dma_channel_hdr = (DMAChannelHeader *)(dma_base_ptr + DMA_CHANNEL * 0x1
 
 The next step is to allocate our control blocks and a buffer to store DMA results. What's special about this is that since DMA accesses uses *bus address*, we need to find a way to know the *bus address* of our allocated memory region.
 
-As bus addresses can be calculated from physical addresses, a straightforward way to get physical addresses out of virtual addresses may be using Linux's [`pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) interface. However, this seems to be reliable because we can't guarantee the memory we have is cache coherent, which is [**crucial to proper DMA**](https://en.wikipedia.org/wiki/Direct_memory_access#Cache_coherency). Also, the exact physical address backing a certain virtual address may be **subject to change**. Thus, **I do not recommend using** `pagemap`.
+As bus addresses can be calculated from physical addresses, a straightforward way to get physical addresses out of virtual addresses may be using Linux's [`pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) interface. However, this seems to be unreliable because we can't guarantee the memory we have is cache coherent, which is [**crucial to proper DMA**](https://en.wikipedia.org/wiki/Direct_memory_access#Cache_coherency). Also, the exact physical address backing a certain virtual address may be **subject to change**. Thus, **I do not recommend using** `pagemap`.
 
 What comes to the rescue here is the [mailbox property interface](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface). As it's developed for communication between the ARM and the GPU, which I guess also suffers from cache coherency problems, it provides ways to [allocate](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface#allocate-memory) contiguous memory on the **coherent** portion of L2 cache & RAM and [lock](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface#lock-memory) it on a fixed bus address. It looks perfectly suitable for DMA, so it's becoming a standard way for projects adopting DMA. We are gonna use it, too.
 
