@@ -10,13 +10,13 @@ I tested my code on my Raspberry Pi 3 B+, but it seems that the only difference 
 
 ## A little Background
 
-As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf) (the "*datasheet*"), There are three types of addresses in Raspberry Pi:
+As described in [BCM2835-ARM-Peripherals](https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf) (the "*datasheet*"), there are three types of memory addresses:
 
-* *ARM Virtual Address*: The address used in the [virtual address space](https://en.wikipedia.org/wiki/Virtual_address_space) of a Linux process.
 * *ARM Physical Address*: The address used when accessing physical memory. Since peripherals on BCM2835 are [memory-mapped](https://en.wikipedia.org/wiki/Memory-mapped_I/O), this address is used to access peripherals directly.
-* *Bus Address*: This is the address used by the DMA engine. A bus address is an address as seen by hardware peripherals.
+* *ARM Virtual Address*: The address used in the [virtual address space](https://en.wikipedia.org/wiki/Virtual_address_space) of a Linux process.
+* *Bus Address*: The address that hardware peripherals use to access memory. This is the address used by the DMA engine. Note that bus address `A` does not necessarily map to physical address `A`; in fact, in our case it doesn't. Linus Torvalds elaborates more on this idea [here](https://tldp.org/LDP/khg/HyperNews/get/devices/addrxlate.html).
 
-The *physical addresses* of the peripherals range from *0x3F000000* to *0x3FFFFFFF* and are mapped onto *bus address* range *0x7F000000* to *0x7FFFFFFF*. We can convert between them like this:
+The *physical addresses* of the peripherals range from *0x20000000* to *0x20FFFFFF* and are mapped onto *bus address* range *0x7E000000* to *0x7FFFFFFF*. We can convert between them like this:
 
 ``` c
 #define BUS_TO_PHYS(x) ((x) & ~0xC0000000
